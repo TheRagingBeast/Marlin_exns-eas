@@ -23,7 +23,7 @@
 
 void task_mem(struct seq_file *m, struct mm_struct *mm)
 {
-	unsigned long data, text, lib, swap;
+	unsigned long data, text, lib, swap, ptes, pmds;
 	unsigned long hiwater_vm, total_vm, hiwater_rss, total_rss;
 
 	/*
@@ -44,6 +44,8 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 	text = (PAGE_ALIGN(mm->end_code) - (mm->start_code & PAGE_MASK)) >> 10;
 	lib = (mm->exec_vm << (PAGE_SHIFT-10)) - text;
 	swap = get_mm_counter(mm, MM_SWAPENTS);
+	ptes = PTRS_PER_PTE * sizeof(pte_t) * atomic_long_read(&mm->nr_ptes);
+	pmds = PTRS_PER_PMD * sizeof(pmd_t) * mm_nr_pmds(mm);
 	seq_printf(m,
 		"VmPeak:\t%8lu kB\n"
 		"VmSize:\t%8lu kB\n"
@@ -56,6 +58,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 		"VmExe:\t%8lu kB\n"
 		"VmLib:\t%8lu kB\n"
 		"VmPTE:\t%8lu kB\n"
+		"VmPMD:\t%8lu kB\n"
 		"VmSwap:\t%8lu kB\n",
 		hiwater_vm << (PAGE_SHIFT-10),
 		total_vm << (PAGE_SHIFT-10),
@@ -65,9 +68,10 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 		total_rss << (PAGE_SHIFT-10),
 		data << (PAGE_SHIFT-10),
 		mm->stack_vm << (PAGE_SHIFT-10), text, lib,
-		(PTRS_PER_PTE * sizeof(pte_t) *
-		 atomic_long_read(&mm->nr_ptes)) >> 10,
+		ptes >> 10,
+		pmds >> 10,
 		swap << (PAGE_SHIFT-10));
+	hugetlb_report_usage(m, mm);
 }
 
 unsigned long task_vsize(struct mm_struct *mm)
@@ -363,7 +367,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 	 */
 	if (file) {
 		seq_pad(m, ' ');
-		seq_path(m, &file->f_path, "\n");
+		seq_file_path(m, file, "\n");
 		goto done;
 	}
 
@@ -507,6 +511,8 @@ struct mem_size_stats {
 	unsigned long swap;
 	unsigned long nonlinear;
 	unsigned long first_vma_start;
+	unsigned long shared_hugetlb;
+	unsigned long private_hugetlb;
 	u64 pss;
 	u64 pss_locked;
 	u64 swap_pss;
@@ -679,6 +685,8 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
 		[ilog2(VM_HUGEPAGE)]	= "hg",
 		[ilog2(VM_NOHUGEPAGE)]	= "nh",
 		[ilog2(VM_MERGEABLE)]	= "mg",
+		[ilog2(VM_UFFD_MISSING)]= "um",
+		[ilog2(VM_UFFD_WP)]	= "uw",
 	};
 	size_t i;
 
@@ -692,6 +700,35 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
 	seq_putc(m, '\n');
 }
 
+#ifdef CONFIG_HUGETLB_PAGE
+static int smaps_hugetlb_range(pte_t *pte, unsigned long hmask,
+				 unsigned long addr, unsigned long end,
+				 struct mm_walk *walk)
+{
+	struct mem_size_stats *mss = walk->private;
+	struct vm_area_struct *vma = walk->vma;
+	struct page *page = NULL;
+
+	if (pte_present(*pte)) {
+		page = vm_normal_page(vma, addr, *pte);
+	} else if (is_swap_pte(*pte)) {
+		swp_entry_t swpent = pte_to_swp_entry(*pte);
+
+		if (is_migration_entry(swpent))
+			page = migration_entry_to_page(swpent);
+	}
+	if (page) {
+		int mapcount = page_mapcount(page);
+
+		if (mapcount >= 2)
+			mss->shared_hugetlb += huge_page_size(hstate_vma(vma));
+		else
+			mss->private_hugetlb += huge_page_size(hstate_vma(vma));
+	}
+	return 0;
+}
+#endif /* HUGETLB_PAGE */
+
 static int show_smap(struct seq_file *m, void *v, int is_pid)
 {
 	struct proc_maps_private *priv = m->private;
@@ -700,6 +737,9 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 	struct mem_size_stats *mss;
 	struct mm_walk smaps_walk = {
 		.pmd_entry = smaps_pte_range,
+#ifdef CONFIG_HUGETLB_PAGE
+		.hugetlb_entry = smaps_hugetlb_range,
+#endif
 		.mm = vma->vm_mm,
 	};
 	int ret = 0;
@@ -765,6 +805,8 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 			   "Anonymous:      %8lu kB\n"
 			   "AnonHugePages:  %8lu kB\n"
 			   "Swap:           %8lu kB\n"
+		           "Shared_Hugetlb: %8lu kB\n"
+		           "Private_Hugetlb: %7lu kB\n"
 			   "SwapPss:        %8lu kB\n"
 			   "Locked:         %8lu kB\n",
 			   mss->resident >> 10,
@@ -776,6 +818,8 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 			   mss->referenced >> 10,
 			   mss->anonymous >> 10,
 			   mss->anonymous_thp >> 10,
+		           mss->shared_hugetlb >> 10,
+		           mss->private_hugetlb >> 10,
 			   mss->swap >> 10,
 			   (unsigned long)(mss->swap_pss >> (10 + PSS_SHIFT)),
 			   (unsigned long)(mss->pss_locked >>
@@ -1898,7 +1942,7 @@ static int show_numa_map(struct seq_file *m, void *v, int is_pid)
 
 	if (file) {
 		seq_puts(m, " file=");
-		seq_path(m, &file->f_path, "\n\t= ");
+		seq_file_path(m, file, "\n\t= ");
 	} else if (vma->vm_start <= mm->brk && vma->vm_end >= mm->start_brk) {
 		seq_puts(m, " heap");
 	} else {

@@ -14,6 +14,7 @@
 #include <linux/page-debug-flags.h>
 #include <linux/uprobes.h>
 #include <linux/page-flags-layout.h>
+#include <linux/workqueue.h>
 #include <asm/page.h>
 #include <asm/mmu.h>
 
@@ -23,6 +24,7 @@
 #define AT_VECTOR_SIZE (2*(AT_VECTOR_SIZE_ARCH + AT_VECTOR_SIZE_BASE + 1))
 
 struct address_space;
+struct mem_cgroup;
 
 #define USE_SPLIT_PTE_PTLOCKS	(NR_CPUS >= CONFIG_SPLIT_PTLOCK_CPUS)
 #define USE_SPLIT_PMD_PTLOCKS	(USE_SPLIT_PTE_PTLOCKS && \
@@ -167,6 +169,10 @@ struct page {
 		struct kmem_cache *slab_cache;	/* SL[AU]B: Pointer to slab */
 		struct page *first_page;	/* Compound tail pages */
 	};
+
+#ifdef CONFIG_MEMCG
+	struct mem_cgroup *mem_cgroup;
+#endif
 
 	/*
 	 * On machines where all RAM is mapped into kernel address space,
@@ -323,6 +329,9 @@ struct vm_area_struct {
 #ifdef CONFIG_NUMA
 	struct mempolicy *vm_policy;	/* NUMA policy for the VMA */
 #endif
+#ifdef CONFIG_UKSM
+	struct vma_slot *uksm_vma_slot;
+#endif
 };
 
 struct core_thread {
@@ -373,7 +382,8 @@ struct mm_struct {
 	pgd_t * pgd;
 	atomic_t mm_users;			/* How many users with user space? */
 	atomic_t mm_count;			/* How many references to "struct mm_struct" (users count as 1) */
-	atomic_long_t nr_ptes;			/* Page table pages */
+	atomic_long_t nr_ptes;			/* PTE page table pages */
+	atomic_long_t nr_pmds;			/* PMD page table pages */
 	int map_count;				/* number of VMAs */
 
 	spinlock_t page_table_lock;		/* Protects page tables and some counters */
@@ -469,10 +479,14 @@ struct mm_struct {
 	bool tlb_flush_pending;
 #endif
 	struct uprobes_state uprobes_state;
+	struct work_struct async_put_work;
 #ifdef CONFIG_MSM_APP_SETTINGS
 	int app_setting;
 #endif
 
+#ifdef CONFIG_HUGETLB_PAGE
+	atomic_long_t hugetlb_usage;
+#endif
 };
 
 static inline void mm_init_cpumask(struct mm_struct *mm)
@@ -552,5 +566,13 @@ static inline const char __user *vma_get_anon_name(struct vm_area_struct *vma)
 
 	return vma->shared.anon_name;
 }
+
+ /*
+  * A swap entry has to fit into a "unsigned long", as the entry is hidden
+  * in the "index" field of the swapper address space.
+  */
+typedef struct {
+	unsigned long val;
+} swp_entry_t;
 
 #endif /* _LINUX_MM_TYPES_H */

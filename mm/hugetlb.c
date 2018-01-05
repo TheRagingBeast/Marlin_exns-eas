@@ -2409,6 +2409,12 @@ void hugetlb_show_meminfo(void)
 				1UL << (huge_page_order(h) + PAGE_SHIFT - 10));
 }
 
+void hugetlb_report_usage(struct seq_file *m, struct mm_struct *mm)
+{
+	seq_printf(m, "HugetlbPages:\t%8lu kB\n",
+		   atomic_long_read(&mm->hugetlb_usage) << (PAGE_SHIFT - 10));
+}
+
 /* Return the number pages of memory we physically have, in PAGE_SIZE units. */
 unsigned long hugetlb_total_pages(void)
 {
@@ -2636,6 +2642,7 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
 			get_page(ptepage);
 			page_dup_rmap(ptepage);
 			set_huge_pte_at(dst, addr, dst_pte, entry);
+			hugetlb_count_add(pages_per_huge_page(h), dst);
 		}
 		spin_unlock(src_ptl);
 		spin_unlock(dst_ptl);
@@ -2715,6 +2722,7 @@ again:
 		if (huge_pte_dirty(pte))
 			set_page_dirty(page);
 
+		hugetlb_count_sub(pages_per_huge_page(h), mm);
 		page_remove_rmap(page);
 		force_flush = !__tlb_remove_page(tlb, page);
 		if (force_flush) {
@@ -3105,6 +3113,7 @@ retry:
 				&& (vma->vm_flags & VM_SHARED)));
 	set_huge_pte_at(mm, address, ptep, new_pte);
 
+	hugetlb_count_add(pages_per_huge_page(h), mm);
 	if ((flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED)) {
 		/* Optimization, do the COW without a second fault */
 		ret = hugetlb_cow(mm, vma, address, ptep, new_pte, page, ptl);
@@ -3309,6 +3318,15 @@ long follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		spinlock_t *ptl = NULL;
 		int absent;
 		struct page *page;
+
+		/*
+		 * If we have a pending SIGKILL, don't keep faulting pages and
+		 * potentially allocating memory.
+		 */
+		if (unlikely(fatal_signal_pending(current))) {
+			remainder = 0;
+			break;
+		}
 
 		/*
 		 * Some archs (sparc64, sh*) have multiple pte_ts to
@@ -3632,6 +3650,7 @@ pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
 		if (saddr) {
 			spte = huge_pte_offset(svma->vm_mm, saddr);
 			if (spte) {
+				mm_inc_nr_pmds(mm);
 				get_page(virt_to_page(spte));
 				break;
 			}
@@ -3643,11 +3662,13 @@ pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
 
 	ptl = huge_pte_lockptr(hstate_vma(vma), mm, spte);
 	spin_lock(ptl);
-	if (pud_none(*pud))
+	if (pud_none(*pud)) {
 		pud_populate(mm, pud,
 				(pmd_t *)((unsigned long)spte & PAGE_MASK));
-	else
+	} else {
 		put_page(virt_to_page(spte));
+		mm_inc_nr_pmds(mm);
+	}
 	spin_unlock(ptl);
 out:
 	pte = (pte_t *)pmd_alloc(mm, pud, addr);
@@ -3678,6 +3699,7 @@ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
 
 	pud_clear(pud);
 	put_page(virt_to_page(ptep));
+	mm_dec_nr_pmds(mm);
 	*addr = ALIGN(*addr, HPAGE_SIZE * PTRS_PER_PTE) - HPAGE_SIZE;
 	return 1;
 }

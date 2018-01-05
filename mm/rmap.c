@@ -955,9 +955,9 @@ void page_move_anon_rmap(struct page *page,
 
 /**
  * __page_set_anon_rmap - set up new anonymous rmap
- * @page:	Page to add to rmap	
+ * @page:	Page to add to rmap
  * @vma:	VM area to add page to.
- * @address:	User virtual address of the mapping	
+ * @address:	User virtual address of the mapping
  * @exclusive:	the page is exclusively owned by the current process
  */
 static void __page_set_anon_rmap(struct page *page,
@@ -1092,24 +1092,20 @@ void page_add_new_anon_rmap(struct page *page,
 void page_add_file_rmap(struct page *page)
 {
 	struct mem_cgroup *memcg;
-	unsigned long flags;
-	bool locked;
 
-	memcg = mem_cgroup_begin_page_stat(page, &locked, &flags);
+	memcg = mem_cgroup_begin_page_stat(page);
 	if (atomic_inc_and_test(&page->_mapcount)) {
 		__inc_zone_page_state(page, NR_FILE_MAPPED);
 		mem_cgroup_inc_page_stat(memcg, MEM_CGROUP_STAT_FILE_MAPPED);
 	}
-	mem_cgroup_end_page_stat(memcg, &locked, &flags);
+	mem_cgroup_end_page_stat(memcg);
 }
 
 static void page_remove_file_rmap(struct page *page)
 {
 	struct mem_cgroup *memcg;
-	unsigned long flags;
-	bool locked;
 
-	memcg = mem_cgroup_begin_page_stat(page, &locked, &flags);
+	memcg = mem_cgroup_begin_page_stat(page);
 
 	/* page still mapped by someone else? */
 	if (!atomic_add_negative(-1, &page->_mapcount))
@@ -1130,7 +1126,7 @@ static void page_remove_file_rmap(struct page *page)
 	if (unlikely(PageMlocked(page)))
 		clear_page_mlock(page);
 out:
-	mem_cgroup_end_page_stat(memcg, &locked, &flags);
+	mem_cgroup_end_page_stat(memcg);
 }
 
 /**
@@ -1227,7 +1223,9 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 	update_hiwater_rss(mm);
 
 	if (PageHWPoison(page) && !(flags & TTU_IGNORE_HWPOISON)) {
-		if (!PageHuge(page)) {
+		if (PageHuge(page)) {
+			hugetlb_count_sub(1 << compound_order(page), mm);
+		} else {
 			if (PageAnon(page))
 				dec_mm_counter(mm, MM_ANONPAGES);
 			else
@@ -1705,6 +1703,8 @@ static int rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc)
 		struct vm_area_struct *vma = avc->vma;
 		unsigned long address = vma_address(page, vma);
 
+		cond_resched();
+
 		if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
 			continue;
 
@@ -1762,6 +1762,8 @@ static int rmap_walk_file(struct page *page, struct rmap_walk_control *rwc)
 
 	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
 		unsigned long address = vma_address(page, vma);
+
+		cond_resched();
 
 		if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
 			continue;

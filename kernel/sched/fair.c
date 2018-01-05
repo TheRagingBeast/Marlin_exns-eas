@@ -6558,6 +6558,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 		return select_energy_cpu_brute(p, prev_cpu, sync);
 
 	rcu_read_lock();
+
 	for_each_domain(cpu, tmp) {
 		if (!(tmp->flags & SD_LOAD_BALANCE))
 			break;

@@ -1047,25 +1047,16 @@ config CGROUP_SCHEDTUNE
 
 	  Say N if unsure.
 
+config PAGE_COUNTER
+       bool
+
 config MEMCG
 	bool "Memory Resource Controller for Control Groups"
-	depends on RESOURCE_COUNTERS
+	select PAGE_COUNTER
 	select EVENTFD
 	help
 	  Provides a memory resource controller that manages both anonymous
 	  memory and page cache. (See Documentation/cgroups/memory.txt)
-
-	  Note that setting this option increases fixed memory overhead
-	  associated with each page of memory in the system. By this,
-	  8(16)bytes/PAGE_SIZE on 32(64)bit system will be occupied by memory
-	  usage tracking struct at boot. Total amount of this is printed out
-	  at boot.
-
-	  Only enable when you're ok with these trade offs and really
-	  sure you need the memory resource controller. Even when you enable
-	  this, you can set "cgroup_disable=memory" at your boot option to
-	  disable memory resource controller and you can avoid overheads.
-	  (and lose benefits of memory resource controller)
 
 config MEMCG_SWAP
 	bool "Memory Resource Controller Swap Extension"
@@ -1512,6 +1503,24 @@ config KALLSYMS_ALL
 	   something like this).
 
 	   Say N unless you really need all symbols.
+
+config KALLSYMS_BASE_RELATIVE
+	bool
+	depends on KALLSYMS
+	default !IA64 && !(TILE && 64BIT)
+	help
+	  Instead of emitting them as absolute values in the native word size,
+	  emit the symbol references in the kallsyms table as 32-bit entries,
+	  each containing a relative value in the range [base, base + U32_MAX]
+	  or, when KALLSYMS_ABSOLUTE_PERCPU is in effect, each containing either
+	  an absolute value in the range [0, S32_MAX] or a relative value in the
+	  range [base, base + S32_MAX], where base is the lowest relative symbol
+	  address encountered in the image.
+
+	  On 64-bit builds, this reduces the size of the address table by 50%,
+	  but more importantly, it results in entries whose values are build
+	  time constants, and no relocation pass is required at runtime to fix
+	  up the entries based on the runtime load address of the kernel.
 
 config PRINTK
 	default y

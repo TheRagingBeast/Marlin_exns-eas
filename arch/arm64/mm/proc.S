@@ -196,12 +196,16 @@ ENTRY(__cpu_setup)
 ENDPROC(__cpu_setup)
 
 	/*
+	 * We set the desired value explicitly, including those of the
+	 * reserved bits. The values of bits EE & E0E were set early in
+	 * el2_setup, which are left untouched below.
+	 *
 	 *                 n n            T
 	 *       U E      WT T UD     US IHBS
 	 *       CE0      XWHW CZ     ME TEEA S
 	 * .... .IEE .... NEAI TE.I ..AD DEN0 ACAM
-	 * 0011 0... 1101 ..0. ..0. 10.. .... .... < hardware reserved
-	 * .... .1.. .... 01.1 11.1 ..01 0001 1101 < software settings
+	 * 0011 0... 1101 ..0. ..0. 10.. .0.. .... < hardware reserved
+	 * .... .1.. .... 01.1 11.1 ..01 0.01 1101 < software settings
 	 */
 	.type	crval, #object
 crval:
@@ -218,5 +222,5 @@ crval:
 #define CR_CBIT		0x4
 #endif
 
-	.word	0x000802c2	// clear
-	.word	0x0405c039 | CR_IBIT | CR_CBIT	// set
+	.word	0xfcffffff			// clear
+	.word	0x34d5d91d | CR_IBIT | CR_CBIT	// set

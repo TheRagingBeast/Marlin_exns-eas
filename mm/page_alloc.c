@@ -49,7 +49,6 @@
 #include <linux/backing-dev.h>
 #include <linux/fault-inject.h>
 #include <linux/page-isolation.h>
-#include <linux/page_cgroup.h>
 #include <linux/debugobjects.h>
 #include <linux/kmemleak.h>
 #include <linux/compaction.h>
@@ -173,7 +172,7 @@ static void __free_pages_ok(struct page *page, unsigned int order);
  *	1G machine -> (16M dma, 784M normal, 224M high)
  *	NORMAL allocation will leave 784M/256 of ram reserved in the ZONE_DMA
  *	HIGHMEM allocation will leave 224M/32 of ram reserved in ZONE_NORMAL
- *	HIGHMEM allocation will (224M+784M)/256 of ram reserved in ZONE_DMA
+ *	HIGHMEM allocation will leave (224M+784M)/256 of ram reserved in ZONE_DMA
  *
  * TBD: should special case ZONE_DMA32 machines here - in those we normally
  * don't need any ZONE_NORMAL reservation
@@ -257,8 +256,6 @@ void set_pageblock_migratetype(struct page *page, int migratetype)
 	set_pageblock_flags_group(page, (unsigned long)migratetype,
 					PB_migrate, PB_migrate_end);
 }
-
-bool oom_killer_disabled __read_mostly;
 
 #ifdef CONFIG_DEBUG_VM
 static int page_outside_zone_boundaries(struct zone *zone, struct page *page)
@@ -393,36 +390,6 @@ void prep_compound_page(struct page *page, unsigned int order)
 		smp_wmb();
 		__SetPageTail(p);
 	}
-}
-
-/* update __split_huge_page_refcount if you change this function */
-static int destroy_compound_page(struct page *page, unsigned long order)
-{
-	int i;
-	int nr_pages = 1 << order;
-	int bad = 0;
-
-	if (unlikely(compound_order(page) != order)) {
-		bad_page(page, "wrong compound order", 0);
-		bad++;
-	}
-
-	__ClearPageHead(page);
-
-	for (i = 1; i < nr_pages; i++) {
-		struct page *p = page + i;
-
-		if (unlikely(!PageTail(p))) {
-			bad_page(page, "PageTail not set", 0);
-			bad++;
-		} else if (unlikely(p->first_page != page)) {
-			bad_page(page, "first_page not consistent", 0);
-			bad++;
-		}
-		__ClearPageTail(p);
-	}
-
-	return bad;
 }
 
 static inline void prep_zero_page(struct page *page, unsigned int order,
@@ -570,10 +537,7 @@ static inline void __free_one_page(struct page *page,
 	max_order = min_t(unsigned int, MAX_ORDER, pageblock_order + 1);
 
 	VM_BUG_ON(!zone_is_initialized(zone));
-
-	if (unlikely(PageCompound(page)))
-		if (unlikely(destroy_compound_page(page, order)))
-			return;
+	VM_BUG_ON_PAGE(page->flags & PAGE_FLAGS_CHECK_AT_PREP, page);
 
 	VM_BUG_ON(migratetype == -1);
 	if (likely(!is_migrate_isolate(migratetype)))
@@ -684,8 +648,10 @@ static inline int free_pages_check(struct page *page)
 		bad_reason = "PAGE_FLAGS_CHECK_AT_FREE flag(s) set";
 		bad_flags = PAGE_FLAGS_CHECK_AT_FREE;
 	}
-	if (unlikely(mem_cgroup_bad_page_check(page)))
-		bad_reason = "cgroup check failed";
+#ifdef CONFIG_MEMCG
+	if (unlikely(page->mem_cgroup))
+		bad_reason = "page still charged to cgroup";
+#endif
 	if (unlikely(bad_reason)) {
 		bad_page(page, bad_reason, bad_flags);
 		return 1;
@@ -971,8 +937,10 @@ static inline int check_new_page(struct page *page)
 		bad_reason = "PAGE_FLAGS_CHECK_AT_PREP flag set";
 		bad_flags = PAGE_FLAGS_CHECK_AT_PREP;
 	}
-	if (unlikely(mem_cgroup_bad_page_check(page)))
-		bad_reason = "cgroup check failed";
+#ifdef CONFIG_MEMCG
+	if (unlikely(page->mem_cgroup))
+		bad_reason = "page still charged to cgroup";
+#endif
 	if (unlikely(bad_reason)) {
 		bad_page(page, bad_reason, bad_flags);
 		return 1;
@@ -2451,23 +2419,24 @@ static inline struct page *
 __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	struct zonelist *zonelist, enum zone_type high_zoneidx,
 	nodemask_t *nodemask, struct zone *preferred_zone,
-	int classzone_idx, int migratetype)
+	int classzone_idx, int migratetype, unsigned long *did_some_progress)
 {
 	struct page *page;
 
-	/* Acquire the per-zone oom lock for each zone */
-	if (!oom_zonelist_trylock(zonelist, gfp_mask)) {
+	*did_some_progress = 0;
+
+	if (oom_killer_disabled)
+		return NULL;
+
+	/*
+	 * Acquire the per-zone oom lock for each zone.  If that
+	 * fails, somebody else is making progress for us.
+	 */
+	if (!mutex_trylock(&oom_lock)) {
+		*did_some_progress = 1;
 		schedule_timeout_uninterruptible(1);
 		return NULL;
 	}
-
-	/*
-	 * PM-freezer should be notified that there might be an OOM killer on
-	 * its way to kill and wake somebody up. This is too early and we might
-	 * end up not killing anything but false positives are acceptable.
-	 * See freeze_processes.
-	 */
-	note_oom_kill();
 
 	/*
 	 * Go through the zonelist yet one more time, keep very high watermark
@@ -2482,12 +2451,25 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 		goto out;
 
 	if (!(gfp_mask & __GFP_NOFAIL)) {
+		/* Coredumps can quickly deplete all memory reserves */
+		if (current->flags & PF_DUMPCORE)
+			goto out;
 		/* The OOM killer will not help higher order allocs */
 		if (order > PAGE_ALLOC_COSTLY_ORDER)
 			goto out;
 		/* The OOM killer does not needlessly kill tasks for lowmem */
 		if (high_zoneidx < ZONE_NORMAL)
 			goto out;
+		/* The OOM killer does not compensate for light reclaim */
+		if (!(gfp_mask & __GFP_FS)) {
+			/*
+			 * XXX: Page reclaim didn't yield anything,
+			 * and the OOM killer can't be invoked, but
+			 * keep looping as per should_alloc_retry().
+			 */
+			*did_some_progress = 1;
+			goto out;
+		}
 		/*
 		 * GFP_THISNODE contains __GFP_NORETRY and we never hit this.
 		 * Sanity check for bare calls of __GFP_THISNODE, not real OOM.
@@ -2499,10 +2481,10 @@ __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 			goto out;
 	}
 	/* Exhausted what can be done so it's blamo time */
-	out_of_memory(zonelist, gfp_mask, order, nodemask, false);
-
+	if (out_of_memory(zonelist, gfp_mask, order, nodemask, false))
+	*did_some_progress = 1;
 out:
-	oom_zonelist_unlock(zonelist, gfp_mask);
+	mutex_unlock(&oom_lock);
 	return page;
 }
 
@@ -2809,7 +2791,7 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	    (gfp_mask & GFP_THISNODE) == GFP_THISNODE)
 		goto nopage;
 
-restart:
+retry:
 	if (!(gfp_mask & __GFP_NO_KSWAPD))
 		wake_all_kswapds(order, zonelist, high_zoneidx,
 				preferred_zone, nodemask);
@@ -2832,7 +2814,6 @@ restart:
 		classzone_idx = zonelist_zone_idx(preferred_zoneref);
 	}
 
-rebalance:
 	/* This is the last chance, in general, before the goto nopage. */
 	page = get_page_from_freelist(gfp_mask, nodemask, order, zonelist,
 			high_zoneidx, alloc_flags & ~ALLOC_NO_WATERMARKS,
@@ -2939,54 +2920,28 @@ rebalance:
 	if (page)
 		goto got_pg;
 
-	/*
-	 * If we failed to make any progress reclaiming, then we are
-	 * running out of options and have to consider going OOM
-	 */
-	if (!did_some_progress) {
-		if (oom_gfp_allowed(gfp_mask)) {
-			if (oom_killer_disabled)
-				goto nopage;
-			/* Coredumps can quickly deplete all memory reserves */
-			if ((current->flags & PF_DUMPCORE) &&
-			    !(gfp_mask & __GFP_NOFAIL))
-				goto nopage;
-			page = __alloc_pages_may_oom(gfp_mask, order,
-					zonelist, high_zoneidx,
-					nodemask, preferred_zone,
-					classzone_idx, migratetype);
-			if (page)
-				goto got_pg;
-
-			if (!(gfp_mask & __GFP_NOFAIL)) {
-				/*
-				 * The oom killer is not called for high-order
-				 * allocations that may fail, so if no progress
-				 * is being made, there are no other options and
-				 * retrying is unlikely to help.
-				 */
-				if (order > PAGE_ALLOC_COSTLY_ORDER)
-					goto nopage;
-				/*
-				 * The oom killer is not called for lowmem
-				 * allocations to prevent needlessly killing
-				 * innocent tasks.
-				 */
-				if (high_zoneidx < ZONE_NORMAL)
-					goto nopage;
-			}
-
-			goto restart;
-		}
-	}
-
 	/* Check if we should retry the allocation */
 	pages_reclaimed += did_some_progress;
 	if (should_alloc_retry(gfp_mask, order, did_some_progress,
 						pages_reclaimed)) {
+		/*
+		 * If we fail to make progress by freeing individual
+		 * pages, but the allocation wants us to keep going,
+		 * start OOM killing tasks.
+		 */
+		if (!did_some_progress) {
+			page = __alloc_pages_may_oom(gfp_mask, order, zonelist,
+						high_zoneidx, nodemask,
+						preferred_zone, classzone_idx,
+						migratetype,&did_some_progress);
+			if (page)
+				goto got_pg;
+			if (!did_some_progress)
+				goto nopage;
+		}
 		/* Wait for some write requests to complete then retry */
 		wait_iff_congested(preferred_zone, BLK_RW_ASYNC, HZ/50);
-		goto rebalance;
+		goto retry;
 	} else {
 		/*
 		 * High-order allocations do not necessarily loop after
@@ -3030,6 +2985,7 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order,
 	unsigned int cpuset_mems_cookie;
 	int alloc_flags = ALLOC_WMARK_LOW|ALLOC_CPUSET|ALLOC_FAIR;
 	int classzone_idx;
+	gfp_t alloc_mask; /* The gfp_t that was actually used for allocation */
 
 	gfp_mask &= gfp_allowed_mask;
 
@@ -3063,22 +3019,24 @@ retry_cpuset:
 	classzone_idx = zonelist_zone_idx(preferred_zoneref);
 
 	/* First allocation attempt */
-	page = get_page_from_freelist(gfp_mask|__GFP_HARDWALL, nodemask, order,
-			zonelist, high_zoneidx, alloc_flags,
-			preferred_zone, classzone_idx, migratetype);
+	alloc_mask = gfp_mask|__GFP_HARDWALL;
+	page = get_page_from_freelist(alloc_mask, nodemask, order, zonelist,
+			high_zoneidx, alloc_flags, preferred_zone,
+			classzone_idx, migratetype);
 	if (unlikely(!page)) {
 		/*
 		 * Runtime PM, block IO and its error handling path
 		 * can deadlock because I/O on the device might not
 		 * complete.
 		 */
-		gfp_mask = memalloc_noio_flags(gfp_mask);
-		page = __alloc_pages_slowpath(gfp_mask, order,
+		alloc_mask = memalloc_noio_flags(gfp_mask);
+
+		page = __alloc_pages_slowpath(alloc_mask, order,
 				zonelist, high_zoneidx, nodemask,
 				preferred_zone, classzone_idx, migratetype);
 	}
 
-	trace_mm_page_alloc(page, order, gfp_mask, migratetype);
+	trace_mm_page_alloc(page, order, alloc_mask, migratetype);
 
 out:
 	/*
@@ -4103,18 +4061,29 @@ static int __build_all_zonelists(void *data)
 	return 0;
 }
 
+static noinline void __init
+build_all_zonelists_init(void)
+{
+	__build_all_zonelists(NULL);
+	mminit_verify_zonelist();
+	cpuset_init_current_mems_allowed();
+}
+
 /*
  * Called with zonelists_mutex held always
  * unless system_state == SYSTEM_BOOTING.
+ *
+ * __ref due to (1) call of __meminit annotated setup_zone_pageset
+ * [we're only called with non-NULL zone through __meminit paths] and
+ * (2) call of __init annotated helper build_all_zonelists_init
+ * [protected by SYSTEM_BOOTING].
  */
 void __ref build_all_zonelists(pg_data_t *pgdat, struct zone *zone)
 {
 	set_zonelist_order();
 
 	if (system_state == SYSTEM_BOOTING) {
-		__build_all_zonelists(NULL);
-		mminit_verify_zonelist();
-		cpuset_init_current_mems_allowed();
+		build_all_zonelists_init();
 	} else {
 #ifdef CONFIG_MEMORY_HOTPLUG
 		if (zone)
@@ -5082,7 +5051,6 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat,
 #endif
 	init_waitqueue_head(&pgdat->kswapd_wait);
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
-	pgdat_page_cgroup_init(pgdat);
 
 	for (j = 0; j < MAX_NR_ZONES; j++) {
 		struct zone *zone = pgdat->node_zones + j;

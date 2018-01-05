@@ -113,6 +113,19 @@ static inline void css_get(struct cgroup_subsys_state *css)
 }
 
 /**
+ * css_get_many - obtain references on the specified css
+ * @css: target css
+ * @n: number of references to get
+ *
+ * The caller must already have a reference.
+ */
+static inline void css_get_many(struct cgroup_subsys_state *css, unsigned int n)
+{
+	if (!(css->flags & CSS_NO_REF))
+		percpu_ref_get_many(&css->refcnt, n);
+}
+
+/**
  * css_tryget - try to obtain a reference on the specified css
  * @css: target css
  *
@@ -157,6 +170,19 @@ static inline void css_put(struct cgroup_subsys_state *css)
 {
 	if (!(css->flags & CSS_NO_REF))
 		percpu_ref_put(&css->refcnt);
+}
+
+/**
+ * css_put_many - put css references
+ * @css: target css
+ * @n: number of references to put
+ *
+ * Put references obtained via css_get() and css_tryget_online().
+ */
+static inline void css_put_many(struct cgroup_subsys_state *css, unsigned int n)
+{
+	if (!(css->flags & CSS_NO_REF))
+		percpu_ref_put_many(&css->refcnt, n);
 }
 
 /* bits in struct cgroup flags field */
@@ -614,6 +640,7 @@ struct cgroup_subsys {
 	void (*css_offline)(struct cgroup_subsys_state *css);
 	void (*css_free)(struct cgroup_subsys_state *css);
 	void (*css_reset)(struct cgroup_subsys_state *css);
+	void (*css_e_css_changed)(struct cgroup_subsys_state *css);
 
 	int (*allow_attach)(struct cgroup_subsys_state *css,
 			    struct cgroup_taskset *tset);
@@ -910,6 +937,8 @@ void css_task_iter_end(struct css_task_iter *it);
 int cgroup_attach_task_all(struct task_struct *from, struct task_struct *);
 int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from);
 
+struct cgroup_subsys_state *cgroup_get_e_css(struct cgroup *cgroup,
+					     struct cgroup_subsys *ss);
 struct cgroup_subsys_state *css_tryget_online_from_dir(struct dentry *dentry,
 						       struct cgroup_subsys *ss);
 int cgroup_attach_task_to_root(struct task_struct *tsk, int wait);
@@ -927,6 +956,8 @@ int subsys_cgroup_allow_attach(struct cgroup_subsys_state *css,
 
 #else /* !CONFIG_CGROUPS */
 
+struct cgroup_subsys_state;
+
 static inline int cgroup_init_early(void) { return 0; }
 static inline int cgroup_init(void) { return 0; }
 static inline void cgroup_fork(struct task_struct *p) {}
@@ -938,6 +969,8 @@ static inline int cgroupstats_build(struct cgroupstats *stats,
 {
 	return -EINVAL;
 }
+
+static inline void css_put(struct cgroup_subsys_state *css) {}
 
 /* No cgroups - nothing to do */
 static inline int cgroup_attach_task_all(struct task_struct *from,

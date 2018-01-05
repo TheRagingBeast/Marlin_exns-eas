@@ -102,14 +102,6 @@ union swap_header {
 	} info;
 };
 
- /* A swap entry has to fit into a "unsigned long", as
-  * the entry is hidden in the "index" field of the
-  * swapper address space.
-  */
-typedef struct {
-	unsigned long val;
-} swp_entry_t;
-
 /*
  * current->reclaim_state points to one of these when a task is running
  * memory reclaim
@@ -408,6 +400,9 @@ extern void free_pages_and_swap_cache(struct page **, int);
 extern struct page *lookup_swap_cache(swp_entry_t);
 extern struct page *read_swap_cache_async(swp_entry_t, gfp_t,
 			struct vm_area_struct *vma, unsigned long addr);
+extern struct page *__read_swap_cache_async(swp_entry_t, gfp_t,
+			struct vm_area_struct *vma, unsigned long addr,
+			bool *new_page_allocated);
 extern struct page *swapin_readahead(swp_entry_t, gfp_t,
 			struct vm_area_struct *vma, unsigned long addr);
 
@@ -454,16 +449,6 @@ extern struct swap_info_struct *page_swap_info(struct page *);
 extern int reuse_swap_page(struct page *);
 extern int try_to_free_swap(struct page *);
 struct backing_dev_info;
-
-#ifdef CONFIG_MEMCG
-extern void
-mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent, bool swapout);
-#else
-static inline void
-mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent, bool swapout)
-{
-}
-#endif
 
 #else /* CONFIG_SWAP */
 
@@ -568,11 +553,6 @@ static inline swp_entry_t get_swap_page(void)
 	swp_entry_t entry;
 	entry.val = 0;
 	return entry;
-}
-
-static inline void
-mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent)
-{
 }
 
 #endif /* CONFIG_SWAP */

@@ -38,7 +38,7 @@
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 #include <linux/swapops.h>
-#include <linux/page_cgroup.h>
+#include <linux/swap_cgroup.h>
 
 static bool swap_count_continued(struct swap_info_struct *, pgoff_t,
 				 unsigned char);
@@ -2097,7 +2097,7 @@ static int swap_show(struct seq_file *swap, void *v)
 	}
 
 	file = si->swap_file;
-	len = seq_path(swap, &file->f_path, " \t\n\\");
+	len = seq_file_path(swap, file, " \t\n\\");
 	seq_printf(swap, "%*s%s\t%u\t%u\t%d\n",
 			len < 40 ? 40 - len : 1, " ",
 			S_ISBLK(file_inode(file)->i_mode) ?
@@ -2567,6 +2567,9 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 				pr_err("swapon: discard_swap(%p): %d\n",
 					p, err);
 		}
+
+		if (blk_queue_fast(bdev_get_queue(p->bdev)))
+			p->flags |= SWP_FAST;
 	}
 
 	if (p->bdev && blk_queue_fast(bdev_get_queue(p->bdev)))
