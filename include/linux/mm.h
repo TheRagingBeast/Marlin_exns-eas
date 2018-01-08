@@ -1125,6 +1125,8 @@ struct zap_details {
 	struct address_space *check_mapping;	/* Check page->mapping if set */
 	pgoff_t	first_index;			/* Lowest page->index to unmap */
 	pgoff_t last_index;			/* Highest page->index to unmap */
+	bool ignore_dirty;			/* Ignore dirty pages */
+	bool check_swap_entries;		/* Check also swap entries */
 };
 
 struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
@@ -2143,6 +2145,10 @@ static inline int in_gate_area(struct mm_struct *mm, unsigned long addr)
 extern int sysctl_drop_caches;
 int drop_caches_sysctl_handler(struct ctl_table *, int,
 					void __user *, size_t *, loff_t *);
+extern int sysctl_shrink_caches_mb;
+int shrink_caches_sysctl_handler(struct ctl_table *table, int write,
+				 void __user *buffer, size_t *length,
+				 loff_t *ppos);
 #endif
 
 
@@ -2244,6 +2250,8 @@ struct reclaim_param {
 extern struct reclaim_param reclaim_task_anon(struct task_struct *task,
 		int nr_to_reclaim);
 #endif
+
+extern int do_madvise(unsigned long start, size_t len_in, int behavior);
 
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MM_H */

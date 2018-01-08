@@ -1382,6 +1382,14 @@ static struct ctl_table vm_table[] = {
 		.extra1		= &one,
 		.extra2		= &four,
 	},
+	{
+		.procname       = "shrink_caches_mb",
+		.data           = &sysctl_shrink_caches_mb,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = shrink_caches_sysctl_handler,
+		.extra1         = &one,
+	},
 #ifdef CONFIG_COMPACTION
 	{
 		.procname	= "compact_memory",
