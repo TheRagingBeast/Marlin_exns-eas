@@ -118,11 +118,6 @@ static inline int task_has_dl_policy(struct task_struct *p)
 	return dl_policy(p->policy);
 }
 
-static inline bool dl_time_before(u64 a, u64 b)
-{
-	return (s64)(a - b) < 0;
-}
-
 /*
  * Tells if entity @a should preempt entity @b.
  */
@@ -670,11 +665,13 @@ struct rq {
 	unsigned long cpu_capacity;
 	unsigned long cpu_capacity_orig;
 
+	struct callback_head *balance_callback;
+
 	unsigned char idle_balance;
 	/* For active balancing */
-	int post_schedule;
 	int active_balance;
 	int push_cpu;
+	struct task_struct *push_task;
 	struct cpu_stop_work active_balance_work;
 	/* cpu of this runqueue: */
 	int cpu;
@@ -776,7 +773,7 @@ DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 
 static inline u64 __rq_clock_broken(struct rq *rq)
 {
-	return ACCESS_ONCE(rq->clock);
+	return READ_ONCE(rq->clock);
 }
 
 static inline u64 rq_clock(struct rq *rq)
@@ -810,6 +807,21 @@ extern int migrate_swap(struct task_struct *, struct task_struct *);
 #endif /* CONFIG_NUMA_BALANCING */
 
 #ifdef CONFIG_SMP
+
+static inline void
+queue_balance_callback(struct rq *rq,
+		       struct callback_head *head,
+		       void (*func)(struct rq *rq))
+{
+	lockdep_assert_held(&rq->lock);
+
+	if (unlikely(head->next))
+		return;
+
+	head->func = (void (*)(struct callback_head *))func;
+	head->next = rq->balance_callback;
+	rq->balance_callback = head;
+}
 
 extern void sched_ttwu_pending(void);
 
@@ -1250,10 +1262,10 @@ struct sched_class {
 	void (*put_prev_task) (struct rq *rq, struct task_struct *p);
 
 #ifdef CONFIG_SMP
-	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
+	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags,
+			       int subling_count_hint);
 	void (*migrate_task_rq)(struct task_struct *p);
 
-	void (*post_schedule) (struct rq *this_rq);
 	void (*task_waking) (struct task_struct *task);
 	void (*task_woken) (struct rq *this_rq, struct task_struct *task);
 
@@ -1378,17 +1390,16 @@ extern void update_max_interval(void);
 extern void init_sched_dl_class(void);
 extern void init_sched_rt_class(void);
 extern void init_sched_fair_class(void);
-extern void init_sched_dl_class(void);
 
 extern void resched_curr(struct rq *rq);
 extern void resched_cpu(int cpu);
 
 extern struct rt_bandwidth def_rt_bandwidth;
 extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+extern void init_rt_schedtune_timer(struct sched_rt_entity *rt_se);
 
 extern struct dl_bandwidth def_dl_bandwidth;
 extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime);
-extern void init_rt_schedtune_timer(struct sched_rt_entity *rt_se);
 extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
 
 unsigned long to_ratio(u64 period, u64 runtime);
@@ -1935,8 +1946,8 @@ extern void print_cfs_stats(struct seq_file *m, int cpu);
 extern void print_rt_stats(struct seq_file *m, int cpu);
 
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
-extern void init_rt_rq(struct rt_rq *rt_rq, struct rq *rq);
-extern void init_dl_rq(struct dl_rq *dl_rq, struct rq *rq);
+extern void init_rt_rq(struct rt_rq *rt_rq);
+extern void init_dl_rq(struct dl_rq *dl_rq);
 
 extern void cfs_bandwidth_usage_inc(void);
 extern void cfs_bandwidth_usage_dec(void);
@@ -2002,11 +2013,6 @@ static inline u64 irq_time_read(int cpu)
 #endif /* CONFIG_64BIT */
 #endif /* CONFIG_IRQ_TIME_ACCOUNTING */
 
-/*
- * task_may_not_preempt - check whether a task may not be preemptible soon
- */
-extern bool task_may_not_preempt(struct task_struct *task, int cpu);
-
 #ifdef CONFIG_CPU_FREQ
 DECLARE_PER_CPU(struct update_util_data *, cpufreq_update_util_data);
 
@@ -2069,3 +2075,8 @@ walt_task_in_cum_window_demand(struct rq *rq, struct task_struct *p)
 #else /* arch_scale_freq_capacity */
 #define arch_scale_freq_invariant()     (false)
 #endif
+
+/*
+ * task_may_not_preempt - check whether a task may not be preemptible soon
+ */
+extern bool task_may_not_preempt(struct task_struct *task, int cpu);

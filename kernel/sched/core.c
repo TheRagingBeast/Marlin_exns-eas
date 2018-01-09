@@ -547,6 +547,8 @@ void wake_q_add(struct wake_q_head *head, struct task_struct *task)
 	if (cmpxchg(&node->next, NULL, WAKE_Q_TAIL))
 		return;
 
+	head->count++;
+
 	get_task_struct(task);
 
 	/*
@@ -555,6 +557,10 @@ void wake_q_add(struct wake_q_head *head, struct task_struct *task)
 	*head->lastp = node;
 	head->lastp = &node->next;
 }
+
+static int
+try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags,
+	       int sibling_count_hint);
 
 void wake_up_q(struct wake_q_head *head)
 {
@@ -570,10 +576,10 @@ void wake_up_q(struct wake_q_head *head)
 		task->wake_q.next = NULL;
 
 		/*
-		 * wake_up_process() implies a wmb() to pair with the queueing
+		 * try_to_wake_up() implies a wmb() to pair with the queueing
 		 * in wake_q_add() so as not to miss wakeups.
 		 */
-		wake_up_process(task);
+		try_to_wake_up(task, TASK_NORMAL, 0, head->count);
 		put_task_struct(task);
 	}
 }
@@ -1650,9 +1656,14 @@ out:
  * The caller (fork, wakeup) owns p->pi_lock, ->cpus_allowed is stable.
  */
 static inline
-int select_task_rq(struct task_struct *p, int cpu, int sd_flags, int wake_flags)
+int select_task_rq(struct task_struct *p, int cpu, int sd_flags, int wake_flags,
+		   int sibling_count_hint)
 {
-	cpu = p->sched_class->select_task_rq(p, cpu, sd_flags, wake_flags);
+	lockdep_assert_held(&p->pi_lock);
+
+	if (p->nr_cpus_allowed > 1)
+		cpu = p->sched_class->select_task_rq(p, cpu, sd_flags, wake_flags,
+						     sibling_count_hint);
 
 	/*
 	 * In order not to call set_task_cpu() on a blocking task we need
@@ -1937,6 +1948,8 @@ static void ttwu_queue(struct task_struct *p, int cpu)
  * @p: the thread to be awakened
  * @state: the mask of task states that can be woken
  * @wake_flags: wake modifier flags (WF_*)
+ * @sibling_count_hint: A hint at the number of threads that are being woken up
+ *                      in this event.
  *
  * Put it on the run-queue if it's not already there. The "current"
  * thread is always on the run-queue (except when the actual
@@ -1948,7 +1961,8 @@ static void ttwu_queue(struct task_struct *p, int cpu)
  * or @state didn't match @p's state.
  */
 static int
-try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags,
+	       int sibling_count_hint)
 {
 	unsigned long flags;
 	int cpu, success = 0;
@@ -2025,7 +2039,13 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	while (p->on_cpu)
 		cpu_relax();
 	/*
-	 * Pairs with the smp_wmb() in finish_lock_switch().
+	 * Combined with the control dependency above, we have an effective
+	 * smp_load_acquire() without the need for full barriers.
+	 *
+	 * Pairs with the smp_store_release() in finish_lock_switch().
+	 *
+	 * This ensures that tasks getting woken will be fully ordered against
+	 * their previous state and preserve Program Order.
 	 */
 	smp_rmb();
 
@@ -2043,8 +2063,8 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	if (p->sched_class->task_waking)
 		p->sched_class->task_waking(p);
 
-	cpu = select_task_rq(p, p->wake_cpu, SD_BALANCE_WAKE, wake_flags);
-
+	cpu = select_task_rq(p, p->wake_cpu, SD_BALANCE_WAKE, wake_flags,
+			     sibling_count_hint);
 	if (task_cpu(p) != cpu) {
 		wake_flags |= WF_MIGRATED;
 		set_task_cpu(p, cpu);
@@ -2126,33 +2146,13 @@ out:
  */
 int wake_up_process(struct task_struct *p)
 {
-	return try_to_wake_up(p, TASK_NORMAL, 0);
+	return try_to_wake_up(p, TASK_NORMAL, 0, 1);
 }
 EXPORT_SYMBOL(wake_up_process);
 
-/**
- * wake_up_process_no_notif - Wake up a specific process without notifying
- * governor
- * @p: The process to be woken up.
- *
- * Attempt to wake up the nominated process and move it to the set of runnable
- * processes.
- *
- * Return: 1 if the process was woken up, 0 if it was already running.
- *
- * It may be assumed that this function implies a write memory barrier before
- * changing the task state if and only if any tasks are woken up.
- */
-int wake_up_process_no_notif(struct task_struct *p)
-{
-	WARN_ON(task_is_stopped_or_traced(p));
-	return try_to_wake_up(p, TASK_NORMAL, WF_NO_NOTIFIER);
-}
-EXPORT_SYMBOL(wake_up_process_no_notif);
-
 int wake_up_state(struct task_struct *p, unsigned int state)
 {
-	return try_to_wake_up(p, state, 0);
+	return try_to_wake_up(p, state, 0, 1);
 }
 
 /*
@@ -2493,7 +2493,7 @@ void wake_up_new_task(struct task_struct *p)
 	 * Use __set_task_cpu() to avoid calling sched_class::migrate_task_rq,
 	 * as we're not fully set-up yet.
 	 */
-	__set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
+	__set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0, 1));
 #endif
 	rq = __task_rq_lock(p);
 	update_rq_clock(rq);
@@ -2622,7 +2622,6 @@ static inline void
 prepare_task_switch(struct rq *rq, struct task_struct *prev,
 		    struct task_struct *next)
 {
-	trace_sched_switch(prev, next);
 	sched_info_switch(rq, prev, next);
 	perf_event_task_sched_out(prev, next);
 	fire_sched_out_preempt_notifiers(prev, next);
@@ -2718,23 +2717,35 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 #ifdef CONFIG_SMP
 
 /* rq->lock is NOT held, but preemption is disabled */
-static inline void post_schedule(struct rq *rq)
+static void __balance_callback(struct rq *rq)
 {
-	if (rq->post_schedule) {
-		unsigned long flags;
+	struct callback_head *head, *next;
+	void (*func)(struct rq *rq);
+	unsigned long flags;
 
-		raw_spin_lock_irqsave(&rq->lock, flags);
-		if (rq->curr->sched_class->post_schedule)
-			rq->curr->sched_class->post_schedule(rq);
-		raw_spin_unlock_irqrestore(&rq->lock, flags);
+	raw_spin_lock_irqsave(&rq->lock, flags);
+	head = rq->balance_callback;
+	rq->balance_callback = NULL;
+	while (head) {
+		func = (void (*)(struct rq *))head->func;
+		next = head->next;
+		head->next = NULL;
+		head = next;
 
-		rq->post_schedule = 0;
+		func(rq);
 	}
+	raw_spin_unlock_irqrestore(&rq->lock, flags);
+}
+
+static inline void balance_callback(struct rq *rq)
+{
+	if (unlikely(rq->balance_callback))
+		__balance_callback(rq);
 }
 
 #else
 
-static inline void post_schedule(struct rq *rq)
+static inline void balance_callback(struct rq *rq)
 {
 }
 
@@ -2759,7 +2770,7 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	 */
 
 	rq = finish_task_switch(prev);
-	post_schedule(rq);
+	balance_callback(rq);
 	preempt_enable();
 
 	if (current->set_child_tid)
@@ -2895,7 +2906,7 @@ void sched_exec(void)
 	int dest_cpu;
 
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
-	dest_cpu = p->sched_class->select_task_rq(p, task_cpu(p), SD_BALANCE_EXEC, 0);
+	dest_cpu = p->sched_class->select_task_rq(p, task_cpu(p), SD_BALANCE_EXEC, 0, 1);
 	if (dest_cpu == smp_processor_id())
 		goto unlock;
 
@@ -3379,12 +3390,15 @@ static void __sched notrace __schedule(bool preempt)
 		rq->curr = next;
 		++*switch_count;
 
+		//trace_sched_switch(preempt, prev, next);
 		rq = context_switch(rq, prev, next); /* unlocks the rq */
 		cpu = cpu_of(rq);
-	} else
+	} else {
+		lockdep_unpin_lock(&rq->lock);
 		raw_spin_unlock_irq(&rq->lock);
+	}
 
-	post_schedule(rq);
+	balance_callback(rq);
 }
 
 static inline void sched_submit_work(struct task_struct *tsk)
@@ -3545,7 +3559,7 @@ asmlinkage __visible void __sched preempt_schedule_irq(void)
 int default_wake_function(wait_queue_t *curr, unsigned mode, int wake_flags,
 			  void *key)
 {
-	return try_to_wake_up(curr->private, mode, wake_flags);
+	return try_to_wake_up(curr->private, mode, wake_flags, 1);
 }
 EXPORT_SYMBOL(default_wake_function);
 
@@ -7671,6 +7685,7 @@ void __init sched_init(void)
 	INIT_LIST_HEAD(&root_task_group.children);
 	INIT_LIST_HEAD(&root_task_group.siblings);
 	autogroup_init(&init_task);
+
 #endif /* CONFIG_CGROUP_SCHED */
 
 	for_each_possible_cpu(i) {
@@ -7682,8 +7697,8 @@ void __init sched_init(void)
 		rq->calc_load_active = 0;
 		rq->calc_load_update = jiffies + LOAD_FREQ;
 		init_cfs_rq(&rq->cfs);
-		init_rt_rq(&rq->rt, rq);
-		init_dl_rq(&rq->dl, rq);
+		init_rt_rq(&rq->rt);
+		init_dl_rq(&rq->dl);
 #ifdef CONFIG_FAIR_GROUP_SCHED
 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
@@ -7725,7 +7740,7 @@ void __init sched_init(void)
 		rq->sd = NULL;
 		rq->rd = NULL;
 		rq->cpu_capacity = rq->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
-		rq->post_schedule = 0;
+		rq->balance_callback = NULL;
 		rq->active_balance = 0;
 		rq->next_balance = jiffies;
 		rq->push_cpu = 0;

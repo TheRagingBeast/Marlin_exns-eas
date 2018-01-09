@@ -838,7 +838,7 @@ binder_enqueue_work_ilocked(struct binder_work *work,
 }
 
 /**
- * binder_enqueue_thread_work_ilocked_nowake() - Add thread work
+ * binder_enqueue_deferred_thread_work_ilocked() - Add deferred thread work
  * @thread:       thread to queue work to
  * @work:         struct binder_work to add to list
  *
@@ -849,8 +849,8 @@ binder_enqueue_work_ilocked(struct binder_work *work,
  * Requires the proc->inner_lock to be held.
  */
 static void
-binder_enqueue_thread_work_ilocked_nowake(struct binder_thread *thread,
-					  struct binder_work *work)
+binder_enqueue_deferred_thread_work_ilocked(struct binder_thread *thread,
+					    struct binder_work *work)
 {
 	binder_enqueue_work_ilocked(work, &thread->todo);
 }
@@ -2371,7 +2371,6 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 		off_end = failed_at;
 	else
 		off_end = (void *)off_start + buffer->offsets_size;
-
 	for (offp = off_start; offp < off_end; offp++) {
 		struct binder_object_header *hdr;
 		size_t object_size = binder_validate_object(buffer, *offp);
@@ -3357,6 +3356,7 @@ static void binder_transaction(struct binder_proc *proc,
 		binder_free_transaction(in_reply_to);
 	} else if (!(t->flags & TF_ONE_WAY)) {
 		BUG_ON(t->buffer->async_transaction != 0);
+		binder_inner_proc_lock(proc);
 		/*
 		 * Defer the TRANSACTION_COMPLETE, so we don't return to
 		 * userspace immediately; this allows the target process to
@@ -3364,8 +3364,7 @@ static void binder_transaction(struct binder_proc *proc,
 		 * latency. We will then return the TRANSACTION_COMPLETE when
 		 * the target replies (or there is an error).
 		 */
-		binder_inner_proc_lock(proc);
-		binder_enqueue_thread_work_ilocked_nowake(thread, tcomplete);
+		binder_enqueue_deferred_thread_work_ilocked(thread, tcomplete);
 		t->need_reply = 1;
 		t->from_parent = thread->transaction_stack;
 		thread->transaction_stack = t;
@@ -4803,7 +4802,6 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = -EFAULT;
 			goto err;
 		}
-
 		break;
 	}
 	default:
@@ -4850,7 +4848,7 @@ static int binder_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	return VM_FAULT_SIGBUS;
 }
 
-static const struct vm_operations_struct binder_vm_ops = {
+static struct vm_operations_struct binder_vm_ops = {
 	.open = binder_vma_open,
 	.close = binder_vma_close,
 	.fault = binder_vm_fault,
