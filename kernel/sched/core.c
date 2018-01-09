@@ -289,6 +289,9 @@ __read_mostly int scheduler_running;
  */
 int sysctl_sched_rt_runtime = 950000;
 
+/* cpus with isolated domains */
+cpumask_var_t cpu_isolated_map;
+
 struct rq *
 lock_rq_of(struct task_struct *p, unsigned long *flags)
 {
@@ -620,7 +623,8 @@ void resched_cpu(int cpu)
 	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
 
-	raw_spin_lock_irqsave(&rq->lock, flags);
+	if (!raw_spin_trylock_irqsave(&rq->lock, flags))
+		return;
 	resched_curr(rq);
 	raw_spin_unlock_irqrestore(&rq->lock, flags);
 }
@@ -1037,7 +1041,11 @@ inline int task_curr(const struct task_struct *p)
 }
 
 /*
- * Can drop rq->lock because from sched_class::switched_from() methods drop it.
+ * switched_from, switched_to and prio_changed must _NOT_ drop rq->lock,
+ * use the balance_callback list if you want balancing.
+ *
+ * this means any call to check_class_changed() must be followed by a call to
+ * balance_callback().
  */
 static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 				       const struct sched_class *prev_class,
@@ -1046,7 +1054,7 @@ static inline void check_class_changed(struct rq *rq, struct task_struct *p,
 	if (prev_class != p->sched_class) {
 		if (prev_class->switched_from)
 			prev_class->switched_from(rq, p);
-		/* Possble rq->lock 'hole'.  */
+
 		p->sched_class->switched_to(rq, p);
 	} else if (oldprio != p->prio || dl_task(p))
 		p->sched_class->prio_changed(rq, p, oldprio);
@@ -2814,6 +2822,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	 * of the scheduler it's an obvious special-case), so we
 	 * do an early lockdep release here:
 	 */
+	lockdep_unpin_lock(&rq->lock);
 	spin_release(&rq->lock.dep_map, 1, _THIS_IP_);
 
 	context_tracking_task_switch(prev, next);
@@ -2885,6 +2894,36 @@ unsigned long nr_iowait_cpu(int cpu)
 	struct rq *this = cpu_rq(cpu);
 	return atomic_read(&this->nr_iowait);
 }
+
+#ifdef CONFIG_CPU_QUIET
+u64 nr_running_integral(unsigned int cpu)
+{
+	unsigned int seqcnt;
+	u64 integral;
+	struct rq *q;
+
+	if (cpu >= nr_cpu_ids)
+		return 0;
+
+	q = cpu_rq(cpu);
+
+	/*
+	 * Update average to avoid reading stalled value if there were
+	 * no run-queue changes for a long time. On the other hand if
+	 * the changes are happening right now, just read current value
+	 * directly.
+	 */
+
+	seqcnt = read_seqcount_begin(&q->ave_seqcnt);
+	integral = do_nr_running_integral(q);
+	if (read_seqcount_retry(&q->ave_seqcnt, seqcnt)) {
+		read_seqcount_begin(&q->ave_seqcnt);
+		integral = q->nr_running_integral;
+	}
+
+	return integral;
+}
+#endif
 
 void get_iowait_load(unsigned long *nr_waiters, unsigned long *load)
 {
@@ -3219,8 +3258,10 @@ static inline void schedule_debug(struct task_struct *prev)
 		panic("corrupted stack end detected inside scheduler\n");
 #endif
 
-	if (unlikely(in_atomic_preempt_off()))
+	if (unlikely(in_atomic_preempt_off())) {
 		__schedule_bug(prev);
+		preempt_count_set(PREEMPT_DISABLED);
+	}
 	rcu_sleep_check();
 
 	profile_hit(SCHED_PROFILING, __builtin_return_address(0));
@@ -3656,7 +3697,11 @@ void rt_mutex_setprio(struct task_struct *p, int prio)
 
 	check_class_changed(rq, p, prev_class, oldprio);
 out_unlock:
+	preempt_disable(); /* avoid rq from going away on us */
 	__task_rq_unlock(rq);
+
+	balance_callback(rq);
+	preempt_enable();
 }
 #endif
 
@@ -3980,9 +4025,23 @@ static bool check_same_owner(struct task_struct *p)
 	return match;
 }
 
+static bool dl_param_changed(struct task_struct *p,
+		const struct sched_attr *attr)
+{
+	struct sched_dl_entity *dl_se = &p->dl;
+
+	if (dl_se->dl_runtime != attr->sched_runtime ||
+		dl_se->dl_deadline != attr->sched_deadline ||
+		dl_se->dl_period != attr->sched_period ||
+		dl_se->flags != attr->sched_flags)
+		return true;
+
+	return false;
+}
+
 static int __sched_setscheduler(struct task_struct *p,
 				const struct sched_attr *attr,
-				bool user)
+				bool user, bool pi)
 {
 	int newprio = dl_policy(attr->sched_policy) ? MAX_DL_PRIO - 1 :
 		      MAX_RT_PRIO - 1 - attr->sched_priority;
@@ -4106,7 +4165,7 @@ recheck:
 			goto change;
 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
 			goto change;
-		if (dl_policy(policy))
+		if (dl_policy(policy) && dl_param_changed(p, attr))
 			goto change;
 
 		p->sched_reset_on_fork = reset_on_fork;
@@ -4166,18 +4225,20 @@ change:
 	p->sched_reset_on_fork = reset_on_fork;
 	oldprio = p->prio;
 
-	/*
-	 * Take priority boosted tasks into account. If the new
-	 * effective priority is unchanged, we just store the new
-	 * normal parameters and do not touch the scheduler class and
-	 * the runqueue. This will be done when the task deboost
-	 * itself.
-	 */
-	new_effective_prio = rt_mutex_get_effective_prio(p, newprio);
-	if (new_effective_prio == oldprio) {
-		__setscheduler_params(p, attr);
-		task_rq_unlock(rq, p, &flags);
-		return 0;
+	if (pi) {
+		/*
+		 * Take priority boosted tasks into account. If the new
+		 * effective priority is unchanged, we just store the new
+		 * normal parameters and do not touch the scheduler class and
+		 * the runqueue. This will be done when the task deboost
+		 * itself.
+		 */
+		new_effective_prio = rt_mutex_get_effective_prio(p, newprio);
+		if (new_effective_prio == oldprio) {
+			__setscheduler_params(p, attr);
+			task_rq_unlock(rq, p, &flags);
+			return 0;
+		}
 	}
 
 	queued = task_on_rq_queued(p);
@@ -4188,7 +4249,7 @@ change:
 		put_prev_task(rq, p);
 
 	prev_class = p->sched_class;
-	__setscheduler(rq, p, attr, true);
+	__setscheduler(rq, p, attr, pi);
 
 	if (running)
 		p->sched_class->set_curr_task(rq);
@@ -4205,9 +4266,17 @@ change:
 	}
 
 	check_class_changed(rq, p, prev_class, oldprio);
+	preempt_disable(); /* avoid rq from going away on us */
 	task_rq_unlock(rq, p, &flags);
 
-	rt_mutex_adjust_pi(p);
+	if (pi)
+		rt_mutex_adjust_pi(p);
+
+	/*
+	 * Run balance callbacks after we've adjusted the PI chain.
+	 */
+	balance_callback(rq);
+	preempt_enable();
 
 	return 0;
 }
@@ -4228,7 +4297,7 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 		attr.sched_policy = policy;
 	}
 
-	return __sched_setscheduler(p, &attr, check);
+	return __sched_setscheduler(p, &attr, check, true);
 }
 /**
  * sched_setscheduler - change the scheduling policy and/or RT priority of a thread.
@@ -4249,7 +4318,7 @@ EXPORT_SYMBOL_GPL(sched_setscheduler);
 
 int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
 {
-	return __sched_setscheduler(p, attr, true);
+	return __sched_setscheduler(p, attr, true, true);
 }
 EXPORT_SYMBOL_GPL(sched_setattr);
 
@@ -6292,9 +6361,6 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
 	update_top_cache_domain(cpu);
 }
 
-/* cpus with isolated domains */
-static cpumask_var_t cpu_isolated_map;
-
 /* Setup the mask of cpus configured for isolated domains */
 static int __init isolated_cpu_setup(char *str)
 {
@@ -7852,11 +7918,11 @@ void ___might_sleep(const char *file, int line, int preempt_offset)
 
 	rcu_sleep_check(); /* WARN_ON_ONCE() by default, no rate limit reqd. */
 	if ((preempt_count_equals(preempt_offset) && !irqs_disabled() &&
-	     !is_idle_task(current)) || oops_in_progress)
+	     !is_idle_task(current)) ||
+	    system_state == SYSTEM_BOOTING || system_state > SYSTEM_RUNNING ||
+	    oops_in_progress)
 		return;
-	if (system_state != SYSTEM_RUNNING &&
-	    (!__might_sleep_init_called || system_state != SYSTEM_BOOTING))
-		return;
+
 	if (time_before(jiffies, prev_jiffy + HZ) && prev_jiffy)
 		return;
 	prev_jiffy = jiffies;
@@ -7888,32 +7954,12 @@ EXPORT_SYMBOL(___might_sleep);
 #endif
 
 #ifdef CONFIG_MAGIC_SYSRQ
-static void normalize_task(struct rq *rq, struct task_struct *p)
-{
-	const struct sched_class *prev_class = p->sched_class;
-	struct sched_attr attr = {
-		.sched_policy = SCHED_NORMAL,
-	};
-	int old_prio = p->prio;
-	int queued;
-
-	queued = task_on_rq_queued(p);
-	if (queued)
-		dequeue_task(rq, p, 0);
-	__setscheduler(rq, p, &attr, false);
-	if (queued) {
-		enqueue_task(rq, p, 0);
-		resched_curr(rq);
-	}
-
-	check_class_changed(rq, p, prev_class, old_prio);
-}
-
 void normalize_rt_tasks(void)
 {
 	struct task_struct *g, *p;
-	unsigned long flags;
-	struct rq *rq;
+	struct sched_attr attr = {
+		.sched_policy = SCHED_NORMAL,
+	};
 
 	read_lock(&tasklist_lock);
 	for_each_process_thread(g, p) {
@@ -7940,9 +7986,7 @@ void normalize_rt_tasks(void)
 			continue;
 		}
 
-		rq = task_rq_lock(p, &flags);
-		normalize_task(rq, p);
-		task_rq_unlock(rq, p, &flags);
+		__sched_setscheduler(p, &attr, false, false);
 	}
 	read_unlock(&tasklist_lock);
 }

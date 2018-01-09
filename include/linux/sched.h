@@ -348,6 +348,8 @@ extern asmlinkage void schedule_tail(struct task_struct *prev);
 extern void init_idle(struct task_struct *idle, int cpu);
 extern void init_idle_bootup_task(struct task_struct *idle);
 
+extern cpumask_var_t cpu_isolated_map;
+
 extern int runqueue_is_locked(int cpu);
 
 #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
@@ -1630,6 +1632,8 @@ struct task_struct {
 #endif
 
 	unsigned long atomic_flags; /* Flags needing atomic access. */
+
+	struct restart_block restart_block;
 
 	pid_t pid;
 	pid_t tgid;
