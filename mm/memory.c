@@ -2091,6 +2091,7 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	 * not dirty accountable.
 	 */
 	if (PageAnon(old_page) && !PageKsm(old_page)) {
+		int total_mapcount;
 		if (!trylock_page(old_page)) {
 			page_cache_get(old_page);
 			pte_unmap_unlock(page_table, ptl);
@@ -2104,12 +2105,17 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
 			page_cache_release(old_page);
 		}
 		if (reuse_swap_page(old_page)) {
-			/*
-			 * The page is all ours.  Move it to our anon_vma so
-			 * the rmap code will not search our parent or siblings.
-			 * Protected against the rmap code by the page lock.
-			 */
-			page_move_anon_rmap(old_page, vma, address);
+			if (total_mapcount == 1) {
+				/*
+				 * The page is all ours. Move it to
+				 * our anon_vma so the rmap code will
+				 * not search our parent or siblings.
+				 * Protected against the rmap code by
+				 * the page lock.
+				 */
+				page_move_anon_rmap(compound_head(old_page),
+						    vma, address);
+			}
 			unlock_page(old_page);
 			goto reuse;
 		}
@@ -2654,15 +2660,16 @@ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	page = alloc_zeroed_user_highpage_movable(vma, address);
 	if (!page)
 		goto oom;
+
+	if (mem_cgroup_try_charge(page, mm, GFP_KERNEL, &memcg))
+		goto oom_free_page;
+
 	/*
 	 * The memory barrier inside __SetPageUptodate makes sure that
 	 * preceeding stores to the page contents become visible before
 	 * the set_pte_at() write.
 	 */
 	__SetPageUptodate(page);
-
-	if (mem_cgroup_try_charge(page, mm, GFP_KERNEL, &memcg))
-		goto oom_free_page;
 
 	entry = mk_pte(page, vma->vm_page_prot);
 	if (vma->vm_flags & VM_WRITE)

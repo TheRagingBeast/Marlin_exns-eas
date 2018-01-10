@@ -1469,7 +1469,7 @@ int move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
 		new_ptl = pmd_lockptr(mm, new_pmd);
 		if (new_ptl != old_ptl)
 			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
-		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
+		pmd = pmdp_huge_get_and_clear(mm, old_addr, old_pmd);
 		VM_BUG_ON(!pmd_none(*new_pmd));
 
 		if (pmd_move_must_withdraw(new_ptl, old_ptl)) {
@@ -2179,7 +2179,8 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 		if (pte_write(pteval)) {
 			writable = true;
 		} else {
-			if (PageSwapCache(page) && !reuse_swap_page(page)) {
+			if (PageSwapCache(page) &&
+			    !reuse_swap_page(page, NULL)) {
 				unlock_page(page);
 				goto out;
 			}
@@ -2498,7 +2499,7 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 * huge and small TLB entries for the same virtual address
 	 * to avoid the risk of CPU bugs in that area.
 	 */
-	_pmd = pmdp_clear_flush(vma, address, pmd);
+	_pmd = pmdp_collapse_flush(vma, address, pmd);
 	spin_unlock(pmd_ptl);
 	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
 
@@ -2798,7 +2799,7 @@ static void khugepaged_do_scan(void)
 
 		cond_resched();
 
-		if (unlikely(kthread_should_stop() || freezing(current)))
+		if (unlikely(kthread_should_stop() || try_to_freeze()))
 			break;
 
 		spin_lock(&khugepaged_mm_lock);
@@ -2819,8 +2820,6 @@ static void khugepaged_do_scan(void)
 
 static void khugepaged_wait_work(void)
 {
-	try_to_freeze();
-
 	if (khugepaged_has_work()) {
 		if (!khugepaged_scan_sleep_millisecs)
 			return;

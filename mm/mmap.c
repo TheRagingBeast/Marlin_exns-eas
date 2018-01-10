@@ -1327,6 +1327,9 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 		apply_app_setting_bit(file);
 #endif
 
+	if (!len)
+		return -EINVAL;
+
 	/*
 	 * Does the application expect PROT_READ to imply PROT_EXEC?
 	 *
@@ -1336,9 +1339,6 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
 		if (!(file && (file->f_path.mnt->mnt_flags & MNT_NOEXEC)))
 			prot |= PROT_EXEC;
-
-	if (!len)
-		return -EINVAL;
 
 	if (!(flags & MAP_FIXED))
 		addr = round_hint_to_min(addr);
@@ -2410,7 +2410,7 @@ find_extend_vma(struct mm_struct *mm, unsigned long addr)
 	if (!prev || expand_stack(prev, addr))
 		return NULL;
 	if (prev->vm_flags & VM_LOCKED)
-		__mlock_vma_pages_range(prev, addr, prev->vm_end, NULL);
+		populate_vma_page_range(prev, addr, prev->vm_end, NULL);
 	return prev;
 }
 #else
@@ -2437,10 +2437,12 @@ find_extend_vma(struct mm_struct *mm, unsigned long addr)
 	if (expand_stack(vma, addr))
 		return NULL;
 	if (vma->vm_flags & VM_LOCKED)
-		__mlock_vma_pages_range(vma, addr, start, NULL);
+		populate_vma_page_range(vma, addr, start, NULL);
 	return vma;
 }
 #endif
+
+EXPORT_SYMBOL_GPL(find_extend_vma);
 
 /*
  * Ok - we have the memory areas we should free on the vma list,

@@ -110,14 +110,6 @@ static inline void put_anon_vma(struct anon_vma *anon_vma)
 		__put_anon_vma(anon_vma);
 }
 
-static inline struct anon_vma *page_anon_vma(struct page *page)
-{
-	if (((unsigned long)page->mapping & PAGE_MAPPING_FLAGS) !=
-					    PAGE_MAPPING_ANON)
-		return NULL;
-	return page_rmapping(page);
-}
-
 static inline void anon_vma_lock_write(struct anon_vma *anon_vma)
 {
 	down_write(&anon_vma->root->rwsem);

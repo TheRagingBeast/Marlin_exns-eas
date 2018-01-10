@@ -137,6 +137,7 @@ extern unsigned int kobjsize(const void *objp);
 
 #define VM_DONTCOPY	0x00020000      /* Do not copy this vma on fork */
 #define VM_DONTEXPAND	0x00040000	/* Cannot expand with mremap() */
+#define VM_LOCKONFAULT	0x00080000	/* Lock the pages covered when they are faulted in */
 #define VM_ACCOUNT	0x00100000	/* Is a VM accounted object */
 #define VM_NORESERVE	0x00200000	/* should the VM suppress accounting */
 #define VM_HUGETLB	0x00400000	/* Huge TLB Page VM */
@@ -194,6 +195,9 @@ extern unsigned int kobjsize(const void *objp);
 
 /* This mask defines which mm->def_flags a process can inherit its parent */
 #define VM_INIT_DEF_MASK	VM_NOHUGEPAGE
+
+/* This mask is used to clear all the VMA flags used by mlock */
+#define VM_LOCKED_CLEAR_MASK	(~(VM_LOCKED | VM_LOCKONFAULT))
 
 /*
  * mapping from the currently active vm_flags protection bits (the
@@ -483,7 +487,7 @@ static inline int PageHeadHuge(struct page *page_head)
 
 static inline bool __compound_tail_refcounted(struct page *page)
 {
-	return !PageSlab(page) && !PageHeadHuge(page);
+	return PageAnon(page) && !PageSlab(page) && !PageHeadHuge(page);
 }
 
 /*
@@ -978,33 +982,9 @@ void page_address_init(void);
 #define page_address_init()  do { } while(0)
 #endif
 
-/*
- * On an anonymous page mapped into a user virtual memory area,
- * page->mapping points to its anon_vma, not to a struct address_space;
- * with the PAGE_MAPPING_ANON bit set to distinguish it.  See rmap.h.
- *
- * On an anonymous page in a VM_MERGEABLE area, if CONFIG_KSM is enabled,
- * the PAGE_MAPPING_KSM bit may be set along with the PAGE_MAPPING_ANON bit;
- * and then page->mapping points, not to an anon_vma, but to a private
- * structure which KSM associates with that merged page.  See ksm.h.
- *
- * PAGE_MAPPING_KSM without PAGE_MAPPING_ANON is currently never used.
- *
- * Please note that, confusingly, "page_mapping" refers to the inode
- * address_space which maps the page from disk; whereas "page_mapped"
- * refers to user virtual address space into which the page is mapped.
- */
-#define PAGE_MAPPING_ANON	1
-#define PAGE_MAPPING_KSM	2
-#define PAGE_MAPPING_FLAGS	(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM)
-
+extern void *page_rmapping(struct page *page);
+extern struct anon_vma *page_anon_vma(struct page *page);
 extern struct address_space *page_mapping(struct page *page);
-
-/* Neutral page->mapping pointer to address_space or anon_vma or other */
-static inline void *page_rmapping(struct page *page)
-{
-	return (void *)((unsigned long)page->mapping & ~PAGE_MAPPING_FLAGS);
-}
 
 extern struct address_space *__page_file_mapping(struct page *);
 
@@ -1015,11 +995,6 @@ struct address_space *page_file_mapping(struct page *page)
 		return __page_file_mapping(page);
 
 	return page->mapping;
-}
-
-static inline int PageAnon(struct page *page)
-{
-	return ((unsigned long)page->mapping & PAGE_MAPPING_ANON) != 0;
 }
 
 /*
@@ -2085,12 +2060,13 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
 #define FOLL_FORCE	0x10	/* get_user_pages read/write w/o permission */
 #define FOLL_NOWAIT	0x20	/* if a disk transfer is needed, start the IO
 				 * and return without waiting upon it */
-#define FOLL_MLOCK	0x40	/* mark page as mlocked */
+#define FOLL_POPULATE	0x40	/* fault in page */
 #define FOLL_SPLIT	0x80	/* don't return transhuge pages, split them */
 #define FOLL_HWPOISON	0x100	/* check page is hwpoisoned */
 #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
 #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
 #define FOLL_TRIED	0x800	/* a retry, previous pass started an IO */
+#define FOLL_MLOCK	0x1000	/* lock present pages */
 #define FOLL_COW	0x4000	/* internal GUP flag */
 
 typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
@@ -2199,11 +2175,46 @@ enum mf_flags {
 extern int memory_failure(unsigned long pfn, int trapno, int flags);
 extern void memory_failure_queue(unsigned long pfn, int trapno, int flags);
 extern int unpoison_memory(unsigned long pfn);
+extern int get_hwpoison_page(struct page *page);
 extern int sysctl_memory_failure_early_kill;
 extern int sysctl_memory_failure_recovery;
 extern void shake_page(struct page *p, int access);
 extern atomic_long_t num_poisoned_pages;
 extern int soft_offline_page(struct page *page, int flags);
+
+
+/*
+ * Error handlers for various types of pages.
+ */
+enum mf_result {
+	MF_IGNORED,	/* Error: cannot be handled */
+	MF_FAILED,	/* Error: handling failed */
+	MF_DELAYED,	/* Will be handled later */
+	MF_RECOVERED,	/* Successfully recovered */
+};
+
+enum mf_action_page_type {
+	MF_MSG_KERNEL,
+	MF_MSG_KERNEL_HIGH_ORDER,
+	MF_MSG_SLAB,
+	MF_MSG_DIFFERENT_COMPOUND,
+	MF_MSG_POISONED_HUGE,
+	MF_MSG_HUGE,
+	MF_MSG_FREE_HUGE,
+	MF_MSG_UNMAP_FAILED,
+	MF_MSG_DIRTY_SWAPCACHE,
+	MF_MSG_CLEAN_SWAPCACHE,
+	MF_MSG_DIRTY_MLOCKED_LRU,
+	MF_MSG_CLEAN_MLOCKED_LRU,
+	MF_MSG_DIRTY_UNEVICTABLE_LRU,
+	MF_MSG_CLEAN_UNEVICTABLE_LRU,
+	MF_MSG_DIRTY_LRU,
+	MF_MSG_CLEAN_LRU,
+	MF_MSG_TRUNCATED_LRU,
+	MF_MSG_BUDDY,
+	MF_MSG_BUDDY_2ND,
+	MF_MSG_UNKNOWN,
+};
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_HUGETLBFS)
 extern void clear_huge_page(struct page *page,

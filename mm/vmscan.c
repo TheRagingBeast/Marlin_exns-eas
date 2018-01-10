@@ -2668,7 +2668,8 @@ static bool pfmemalloc_watermark_ok(pg_data_t *pgdat)
 
 	for (i = 0; i <= ZONE_NORMAL; i++) {
 		zone = &pgdat->node_zones[i];
-		if (!populated_zone(zone))
+		if (!populated_zone(zone) ||
+		    zone_reclaimable_pages(zone) == 0)
 			continue;
 
 		pfmemalloc_reserve += min_wmark_pages(zone);
@@ -3649,7 +3650,7 @@ int zone_reclaim_mode __read_mostly;
 #define RECLAIM_OFF 0
 #define RECLAIM_ZONE (1<<0)	/* Run shrink_inactive_list on the zone */
 #define RECLAIM_WRITE (1<<1)	/* Writeout pages during reclaim */
-#define RECLAIM_SWAP (1<<2)	/* Swap pages out during reclaim */
+#define RECLAIM_UNMAP (1<<2)	/* Unmap pages during reclaim */
 
 /*
  * Priority for ZONE_RECLAIM. This determines the fraction of pages
@@ -3691,12 +3692,12 @@ static long zone_pagecache_reclaimable(struct zone *zone)
 	long delta = 0;
 
 	/*
-	 * If RECLAIM_SWAP is set, then all file pages are considered
+	 * If RECLAIM_UNMAP is set, then all file pages are considered
 	 * potentially reclaimable. Otherwise, we have to worry about
 	 * pages like swapcache and zone_unmapped_file_pages() provides
 	 * a better estimate
 	 */
-	if (zone_reclaim_mode & RECLAIM_SWAP)
+	if (zone_reclaim_mode & RECLAIM_UNMAP)
 		nr_pagecache_reclaimable = zone_page_state(zone, NR_FILE_PAGES);
 	else
 		nr_pagecache_reclaimable = zone_unmapped_file_pages(zone);

@@ -392,20 +392,6 @@ void prep_compound_page(struct page *page, unsigned int order)
 	}
 }
 
-static inline void prep_zero_page(struct page *page, unsigned int order,
-							gfp_t gfp_flags)
-{
-	int i;
-
-	/*
-	 * clear_highpage() will use KM_USER0, so it's a bug to use __GFP_ZERO
-	 * and __GFP_HIGHMEM from hard or soft interrupt context.
-	 */
-	VM_BUG_ON((gfp_flags & __GFP_HIGHMEM) && in_interrupt());
-	for (i = 0; i < (1 << order); i++)
-		clear_highpage(page + i);
-}
-
 #ifdef CONFIG_DEBUG_PAGEALLOC
 unsigned int _debug_guardpage_minorder;
 
@@ -1416,7 +1402,7 @@ void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp)
 	int to_drain, batch;
 
 	local_irq_save(flags);
-	batch = ACCESS_ONCE(pcp->batch);
+	batch = READ_ONCE(pcp->batch);
 	to_drain = min(pcp->count, batch);
 	if (to_drain > 0) {
 		free_pcppages_bulk(zone, to_drain, pcp);
@@ -1584,7 +1570,7 @@ void free_hot_cold_page(struct page *page, bool cold)
 		list_add_tail(&page->lru, &pcp->lists[migratetype]);
 	pcp->count++;
 	if (pcp->count >= pcp->high) {
-		unsigned long batch = ACCESS_ONCE(pcp->batch);
+		unsigned long batch = READ_ONCE(pcp->batch);
 		free_pcppages_bulk(zone, batch, pcp);
 		pcp->count -= batch;
 	}
@@ -2373,48 +2359,6 @@ void warn_alloc_failed(gfp_t gfp_mask, unsigned int order, const char *fmt, ...)
 		show_mem(filter);
 }
 
-static inline int
-should_alloc_retry(gfp_t gfp_mask, unsigned int order,
-				unsigned long did_some_progress,
-				unsigned long pages_reclaimed)
-{
-	/* Do not loop if specifically requested */
-	if (gfp_mask & __GFP_NORETRY)
-		return 0;
-
-	/* Always retry if specifically requested */
-	if (gfp_mask & __GFP_NOFAIL)
-		return 1;
-
-	/*
-	 * Suspend converts GFP_KERNEL to __GFP_WAIT which can prevent reclaim
-	 * making forward progress without invoking OOM. Suspend also disables
-	 * storage devices so kswapd will not help. Bail if we are suspending.
-	 */
-	if (!did_some_progress && pm_suspended_storage())
-		return 0;
-
-	/*
-	 * In this implementation, order <= PAGE_ALLOC_COSTLY_ORDER
-	 * means __GFP_NOFAIL, but that may not be true in other
-	 * implementations.
-	 */
-	if (order <= PAGE_ALLOC_COSTLY_ORDER)
-		return 1;
-
-	/*
-	 * For order > PAGE_ALLOC_COSTLY_ORDER, if __GFP_REPEAT is
-	 * specified, then we retry until we no longer reclaim any pages
-	 * (above), or we've reclaimed an order of pages at least as
-	 * large as the allocation's order. In both cases, if the
-	 * allocation still fails, we stop retrying.
-	 */
-	if (gfp_mask & __GFP_REPEAT && pages_reclaimed < (1 << order))
-		return 1;
-
-	return 0;
-}
-
 static inline struct page *
 __alloc_pages_may_oom(gfp_t gfp_mask, unsigned int order,
 	struct zonelist *zonelist, enum zone_type high_zoneidx,
@@ -2922,23 +2866,8 @@ retry:
 
 	/* Check if we should retry the allocation */
 	pages_reclaimed += did_some_progress;
-	if (should_alloc_retry(gfp_mask, order, did_some_progress,
-						pages_reclaimed)) {
-		/*
-		 * If we fail to make progress by freeing individual
-		 * pages, but the allocation wants us to keep going,
-		 * start OOM killing tasks.
-		 */
-		if (!did_some_progress) {
-			page = __alloc_pages_may_oom(gfp_mask, order, zonelist,
-						high_zoneidx, nodemask,
-						preferred_zone, classzone_idx,
-						migratetype,&did_some_progress);
-			if (page)
-				goto got_pg;
-			if (!did_some_progress)
-				goto nopage;
-		}
+	if ((did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER) ||
+	    ((gfp_mask & __GFP_REPEAT) && pages_reclaimed < (1 << order))) {
 		/* Wait for some write requests to complete then retry */
 		wait_iff_congested(preferred_zone, BLK_RW_ASYNC, HZ/50);
 		goto retry;
@@ -4910,22 +4839,28 @@ static void __meminit calculate_node_totalpages(struct pglist_data *pgdat,
 						unsigned long *zones_size,
 						unsigned long *zholes_size)
 {
-	unsigned long realtotalpages, totalpages = 0;
+	unsigned long realtotalpages = 0, totalpages = 0;
 	enum zone_type i;
 
-	for (i = 0; i < MAX_NR_ZONES; i++)
-		totalpages += zone_spanned_pages_in_node(pgdat->node_id, i,
-							 node_start_pfn,
-							 node_end_pfn,
-							 zones_size);
-	pgdat->node_spanned_pages = totalpages;
+	for (i = 0; i < MAX_NR_ZONES; i++) {
+		struct zone *zone = pgdat->node_zones + i;
+		unsigned long size, real_size;
 
-	realtotalpages = totalpages;
-	for (i = 0; i < MAX_NR_ZONES; i++)
-		realtotalpages -=
-			zone_absent_pages_in_node(pgdat->node_id, i,
+		size = zone_spanned_pages_in_node(pgdat->node_id, i,
+						  node_start_pfn,
+						  node_end_pfn,
+						  zones_size);
+		real_size = size - zone_absent_pages_in_node(pgdat->node_id, i,
 						  node_start_pfn, node_end_pfn,
 						  zholes_size);
+		zone->spanned_pages = size;
+		zone->present_pages = real_size;
+
+		totalpages += size;
+		realtotalpages += real_size;
+	}
+
+	pgdat->node_spanned_pages = totalpages;
 	pgdat->node_present_pages = realtotalpages;
 	printk(KERN_DEBUG "On node %d totalpages: %lu\n", pgdat->node_id,
 							realtotalpages);
@@ -5035,8 +4970,7 @@ static unsigned long __paginginit calc_memmap_size(unsigned long spanned_pages,
  * NOTE: pgdat should get zeroed by caller.
  */
 static void __paginginit free_area_init_core(struct pglist_data *pgdat,
-		unsigned long node_start_pfn, unsigned long node_end_pfn,
-		unsigned long *zones_size, unsigned long *zholes_size)
+		unsigned long node_start_pfn, unsigned long node_end_pfn)
 {
 	enum zone_type j;
 	int nid = pgdat->node_id;
@@ -5056,12 +4990,8 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat,
 		struct zone *zone = pgdat->node_zones + j;
 		unsigned long size, realsize, freesize, memmap_pages;
 
-		size = zone_spanned_pages_in_node(nid, j, node_start_pfn,
-						  node_end_pfn, zones_size);
-		realsize = freesize = size - zone_absent_pages_in_node(nid, j,
-								node_start_pfn,
-								node_end_pfn,
-								zholes_size);
+		size = zone->spanned_pages;
+		realsize = freesize = zone->present_pages;
 
 		/*
 		 * Adjust freesize so that it accounts for how much memory
@@ -5094,8 +5024,6 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat,
 			nr_kernel_pages -= memmap_pages;
 		nr_all_pages += freesize;
 
-		zone->spanned_pages = size;
-		zone->present_pages = realsize;
 		/*
 		 * Set an approximate value for lowmem here, it will be adjusted
 		 * when the bootmem allocator frees pages into the buddy system.
@@ -5201,8 +5129,7 @@ void __paginginit free_area_init_node(int nid, unsigned long *zones_size,
 		(unsigned long)pgdat->node_mem_map);
 #endif
 
-	free_area_init_core(pgdat, start_pfn, end_pfn,
-			    zones_size, zholes_size);
+	free_area_init_core(pgdat, start_pfn, end_pfn);
 }
 
 #ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
@@ -6158,9 +6085,9 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_NUMA
 int hashdist = HASHDIST_DEFAULT;
 
-#ifdef CONFIG_NUMA
 static int __init set_hashdist(char *str)
 {
 	if (!str)
@@ -6352,7 +6279,7 @@ void set_pfnblock_flags_mask(struct page *page, unsigned long flags,
 	mask <<= (BITS_PER_LONG - bitidx - 1);
 	flags <<= (BITS_PER_LONG - bitidx - 1);
 
-	word = ACCESS_ONCE(bitmap[word_bitidx]);
+	word = READ_ONCE(bitmap[word_bitidx]);
 	for (;;) {
 		old_word = cmpxchg(&bitmap[word_bitidx], word, (word & ~mask) | flags);
 		if (word == old_word)

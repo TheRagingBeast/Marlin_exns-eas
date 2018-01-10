@@ -20,13 +20,6 @@ struct mem_cgroup;
 int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
 		unsigned long end, int advice, unsigned long *vm_flags);
 
-/*
- * A KSM page is one of those write-protected "shared pages" or "merged pages"
- * which KSM maps into multiple mms, wherever identical anonymous page content
- * is found in VM_MERGEABLE vmas.  It's a PageAnon page, pointing not to any
- * anon_vma, but to that page's node of the stable tree.
- */
-static inline int PageKsm(struct page *page)
 {
 	return ((unsigned long)page->mapping & PAGE_MAPPING_FLAGS) ==
 				(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM);
@@ -97,11 +90,6 @@ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 
 static inline void ksm_exit(struct mm_struct *mm)
 {
-}
-
-static inline int PageKsm(struct page *page)
-{
-	return 0;
 }
 
 #ifdef CONFIG_MMU
