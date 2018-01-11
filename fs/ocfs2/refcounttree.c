@@ -4277,7 +4277,7 @@ static int ocfs2_reflink(struct dentry *old_dentry, struct inode *dir,
 					     &new_orphan_inode);
 	if (error) {
 		mlog_errno(error);
-		goto out;
+		return error;
 	}
 
 	error = ocfs2_rw_lock(inode, 1);

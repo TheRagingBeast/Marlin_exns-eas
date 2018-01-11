@@ -78,6 +78,7 @@
 #include <linux/random.h>
 #include <linux/list.h>
 #include <linux/msm_rtb.h>
+#include <linux/io.h>
 
 #include <asm/io.h>
 #include <asm/bugs.h>
@@ -509,6 +510,7 @@ static void __init mm_init(void)
 	percpu_init_late();
 	pgtable_init();
 	vmalloc_init();
+	ioremap_huge_init();
 }
 
 asmlinkage __visible void __init start_kernel(void)
