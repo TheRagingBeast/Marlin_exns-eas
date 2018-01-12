@@ -55,7 +55,7 @@
 #define vmemmap			((struct page *)VMEMMAP_START - \
 				 SECTION_ALIGN_DOWN(memstart_addr >> PAGE_SHIFT))
 
-#define FIRST_USER_ADDRESS	0
+#define FIRST_USER_ADDRESS	0UL
 
 #ifndef __ASSEMBLY__
 extern void __pte_error(const char *file, int line, unsigned long val);

@@ -338,9 +338,6 @@ struct mem_cgroup {
 	struct cg_proto tcp_mem;
 #endif
 #if defined(CONFIG_MEMCG_KMEM)
-	/* analogous to slab_common's slab_caches list, but per-memcg;
-	 * protected by memcg_slab_mutex */
-	struct list_head memcg_slab_caches;
         /* Index in the kmem_cache->memcg_params->memcg_caches array */
 	int kmemcg_id;
 #endif
@@ -2496,47 +2493,8 @@ static void commit_charge(struct page *page, struct mem_cgroup *memcg,
 }
 
 #ifdef CONFIG_MEMCG_KMEM
-/*
- * The memcg_slab_mutex is held whenever a per memcg kmem cache is created or
- * destroyed. It protects memcg_caches arrays and memcg_slab_caches lists.
- */
-static DEFINE_MUTEX(memcg_slab_mutex);
-
-/*
- * This is a bit cumbersome, but it is rarely used and avoids a backpointer
- * in the memcg_cache_params struct.
- */
-static struct kmem_cache *memcg_params_to_cache(struct memcg_cache_params *p)
-{
-	struct kmem_cache *cachep;
-
-	VM_BUG_ON(p->is_root_cache);
-	cachep = p->root_cache;
-	return cache_from_memcg_idx(cachep, memcg_cache_id(p->memcg));
-}
-
-#ifdef CONFIG_SLABINFO
-static int mem_cgroup_slabinfo_read(struct seq_file *m, void *v)
-{
-	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
-	struct memcg_cache_params *params;
-
-	if (!memcg_kmem_is_active(memcg))
-		return -EIO;
-
-	print_slabinfo_header(m);
-
-	mutex_lock(&memcg_slab_mutex);
-	list_for_each_entry(params, &memcg->memcg_slab_caches, list)
-		cache_show(memcg_params_to_cache(params), m);
-	mutex_unlock(&memcg_slab_mutex);
-
-	return 0;
-}
-#endif
-
-static int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
-			     unsigned long nr_pages)
+int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
+		      unsigned long nr_pages)
 {
 	struct page_counter *counter;
 	int ret = 0;
@@ -2573,8 +2531,7 @@ static int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
 	return ret;
 }
 
-static void memcg_uncharge_kmem(struct mem_cgroup *memcg,
-				unsigned long nr_pages)
+void memcg_uncharge_kmem(struct mem_cgroup *memcg, unsigned long nr_pages)
 {
 	page_counter_uncharge(&memcg->memory, nr_pages);
 	if (do_swap_account)
@@ -2619,10 +2576,7 @@ static int memcg_alloc_cache_id(void)
 	else if (size > MEMCG_CACHES_MAX_SIZE)
 		size = MEMCG_CACHES_MAX_SIZE;
 
-	mutex_lock(&memcg_slab_mutex);
 	err = memcg_update_all_caches(size);
-	mutex_unlock(&memcg_slab_mutex);
-
 	if (err) {
 		ida_simple_remove(&memcg_cache_ida, id);
 		return err;
@@ -2645,123 +2599,20 @@ void memcg_update_array_size(int num)
 	memcg_nr_cache_ids = num;
 }
 
-static void memcg_register_cache(struct mem_cgroup *memcg,
-				 struct kmem_cache *root_cache)
-{
-	static char memcg_name_buf[NAME_MAX + 1]; /* protected by
-						     memcg_slab_mutex */
-	struct kmem_cache *cachep;
-	int id;
-
-	lockdep_assert_held(&memcg_slab_mutex);
-
-	id = memcg_cache_id(memcg);
-
-	/*
-	 * Since per-memcg caches are created asynchronously on first
-	 * allocation (see memcg_kmem_get_cache()), several threads can try to
-	 * create the same cache, but only one of them may succeed.
-	 */
-	if (cache_from_memcg_idx(root_cache, id))
-		return;
-
-	cgroup_name(memcg->css.cgroup, memcg_name_buf, NAME_MAX + 1);
-	cachep = memcg_create_kmem_cache(memcg, root_cache, memcg_name_buf);
-	/*
-	 * If we could not create a memcg cache, do not complain, because
-	 * that's not critical at all as we can always proceed with the root
-	 * cache.
-	 */
-	if (!cachep)
-		return;
-
-	list_add(&cachep->memcg_params->list, &memcg->memcg_slab_caches);
-
-	/*
-	 * Since readers won't lock (see cache_from_memcg_idx()), we need a
-	 * barrier here to ensure nobody will see the kmem_cache partially
-	 * initialized.
-	 */
-	smp_wmb();
-
-	BUG_ON(root_cache->memcg_params->memcg_caches[id]);
-	root_cache->memcg_params->memcg_caches[id] = cachep;
-}
-
-static void memcg_unregister_cache(struct kmem_cache *cachep)
-{
-	struct kmem_cache *root_cache;
-	struct mem_cgroup *memcg;
-	int id;
-
-	lockdep_assert_held(&memcg_slab_mutex);
-
-	BUG_ON(is_root_cache(cachep));
-
-	root_cache = cachep->memcg_params->root_cache;
-	memcg = cachep->memcg_params->memcg;
-	id = memcg_cache_id(memcg);
-
-	BUG_ON(root_cache->memcg_params->memcg_caches[id] != cachep);
-	root_cache->memcg_params->memcg_caches[id] = NULL;
-
-	list_del(&cachep->memcg_params->list);
-
-	kmem_cache_destroy(cachep);
-}
-
-int __memcg_cleanup_cache_params(struct kmem_cache *s)
-{
-	struct kmem_cache *c;
-	int i, failed = 0;
-
-	mutex_lock(&memcg_slab_mutex);
-	for_each_memcg_cache_index(i) {
-		c = cache_from_memcg_idx(s, i);
-		if (!c)
-			continue;
-
-		memcg_unregister_cache(c);
-
-		if (cache_from_memcg_idx(s, i))
-			failed++;
-	}
-	mutex_unlock(&memcg_slab_mutex);
-	return failed;
-}
-
-static void memcg_unregister_all_caches(struct mem_cgroup *memcg)
-{
-	struct kmem_cache *cachep;
-	struct memcg_cache_params *params, *tmp;
-
-	if (!memcg_kmem_is_active(memcg))
-		return;
-
-	mutex_lock(&memcg_slab_mutex);
-	list_for_each_entry_safe(params, tmp, &memcg->memcg_slab_caches, list) {
-		cachep = memcg_params_to_cache(params);
-		memcg_unregister_cache(cachep);
-	}
-	mutex_unlock(&memcg_slab_mutex);
-}
-
-struct memcg_register_cache_work {
+struct memcg_kmem_cache_create_work {
 	struct mem_cgroup *memcg;
 	struct kmem_cache *cachep;
 	struct work_struct work;
 };
 
-static void memcg_register_cache_func(struct work_struct *w)
+static void memcg_kmem_cache_create_func(struct work_struct *w)
 {
-	struct memcg_register_cache_work *cw =
-		container_of(w, struct memcg_register_cache_work, work);
+	struct memcg_kmem_cache_create_work *cw =
+		container_of(w, struct memcg_kmem_cache_create_work, work);
 	struct mem_cgroup *memcg = cw->memcg;
 	struct kmem_cache *cachep = cw->cachep;
 
-	mutex_lock(&memcg_slab_mutex);
-	memcg_register_cache(memcg, cachep);
-	mutex_unlock(&memcg_slab_mutex);
+	memcg_create_kmem_cache(memcg, cachep);
 
 	css_put(&memcg->css);
 	kfree(cw);
@@ -2770,10 +2621,10 @@ static void memcg_register_cache_func(struct work_struct *w)
 /*
  * Enqueue the creation of a per-memcg kmem_cache.
  */
-static void __memcg_schedule_register_cache(struct mem_cgroup *memcg,
-					    struct kmem_cache *cachep)
+static void __memcg_schedule_kmem_cache_create(struct mem_cgroup *memcg,
+					       struct kmem_cache *cachep)
 {
-	struct memcg_register_cache_work *cw;
+	struct memcg_kmem_cache_create_work *cw;
 
 	cw = kmalloc(sizeof(*cw), GFP_NOWAIT);
 	if (!cw)
@@ -2783,18 +2634,18 @@ static void __memcg_schedule_register_cache(struct mem_cgroup *memcg,
 
 	cw->memcg = memcg;
 	cw->cachep = cachep;
+	INIT_WORK(&cw->work, memcg_kmem_cache_create_func);
 
-	INIT_WORK(&cw->work, memcg_register_cache_func);
 	schedule_work(&cw->work);
 }
 
-static void memcg_schedule_register_cache(struct mem_cgroup *memcg,
-					  struct kmem_cache *cachep)
+static void memcg_schedule_kmem_cache_create(struct mem_cgroup *memcg,
+					     struct kmem_cache *cachep)
 {
 	/*
 	 * We need to stop accounting when we kmalloc, because if the
 	 * corresponding kmalloc cache is not yet created, the first allocation
-	 * in __memcg_schedule_register_cache will recurse.
+	 * in __memcg_schedule_kmem_cache_create will recurse.
 	 *
 	 * However, it is better to enclose the whole function. Depending on
 	 * the debugging options enabled, INIT_WORK(), for instance, can
@@ -2803,22 +2654,8 @@ static void memcg_schedule_register_cache(struct mem_cgroup *memcg,
 	 * the safest choice is to do it like this, wrapping the whole function.
 	 */
 	current->memcg_kmem_skip_account = 1;
-	__memcg_schedule_register_cache(memcg, cachep);
+	__memcg_schedule_kmem_cache_create(memcg, cachep);
 	current->memcg_kmem_skip_account = 0;
-}
-
-int __memcg_charge_slab(struct kmem_cache *cachep, gfp_t gfp, int order)
-{
-	unsigned int nr_pages = 1 << order;
-
-	return memcg_charge_kmem(cachep->memcg_params->memcg, gfp, nr_pages);
-}
-
-void __memcg_uncharge_slab(struct kmem_cache *cachep, int order)
-{
-	unsigned int nr_pages = 1 << order;
-
-	memcg_uncharge_kmem(cachep->memcg_params->memcg, nr_pages);
 }
 
 /*
@@ -2865,7 +2702,7 @@ struct kmem_cache *__memcg_kmem_get_cache(struct kmem_cache *cachep)
 	 * could happen with the slab_mutex held. So it's better to
 	 * defer everything.
 	 */
-	memcg_schedule_register_cache(memcg, cachep);
+	memcg_schedule_kmem_cache_create(memcg, cachep);
 out:
 	css_put(&memcg->css);
 	return cachep;
@@ -4113,7 +3950,7 @@ static int memcg_init_kmem(struct mem_cgroup *memcg, struct cgroup_subsys *ss)
 
 static void memcg_destroy_kmem(struct mem_cgroup *memcg)
 {
-	memcg_unregister_all_caches(memcg);
+	memcg_destroy_kmem_caches(memcg);
 	mem_cgroup_sockets_destroy(memcg);
 }
 #else
@@ -4287,7 +4124,7 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	 *
 	 * DO NOT ADD NEW FILES.
 	 */
-	name = cfile.file->f_dentry->d_name.name;
+	name = cfile.file->f_path.dentry->d_name.name;
 
 	if (!strcmp(name, "memory.usage_in_bytes")) {
 		event->register_event = mem_cgroup_usage_register_event;
@@ -4311,7 +4148,7 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
 	 * automatically removed on cgroup destruction but the removal is
 	 * asynchronous, so take an extra ref on @css.
 	 */
-	cfile_css = css_tryget_online_from_dir(cfile.file->f_dentry->d_parent,
+	cfile_css = css_tryget_online_from_dir(cfile.file->f_path.dentry->d_parent,
 					       &memory_cgrp_subsys);
 	ret = -EINVAL;
 	if (IS_ERR(cfile_css))
@@ -4588,7 +4425,6 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	spin_lock_init(&memcg->event_list_lock);
 #ifdef CONFIG_MEMCG_KMEM
 	memcg->kmemcg_id = -1;
-	INIT_LIST_HEAD(&memcg->memcg_slab_caches);
 #endif
 
 	return &memcg->css;

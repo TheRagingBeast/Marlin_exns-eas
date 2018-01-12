@@ -1056,31 +1056,30 @@ static void cgroup_put(struct cgroup *cgrp)
 }
 
 /**
- * cgroup_refresh_child_subsys_mask - update child_subsys_mask
+ * cgroup_calc_child_subsys_mask - calculate child_subsys_mask
  * @cgrp: the target cgroup
+ * @subtree_control: the new subtree_control mask to consider
  *
  * On the default hierarchy, a subsystem may request other subsystems to be
  * enabled together through its ->depends_on mask.  In such cases, more
  * subsystems than specified in "cgroup.subtree_control" may be enabled.
  *
- * This function determines which subsystems need to be enabled given the
- * current @cgrp->subtree_control and records it in
- * @cgrp->child_subsys_mask.  The resulting mask is always a superset of
- * @cgrp->subtree_control and follows the usual hierarchy rules.
+ * This function calculates which subsystems need to be enabled if
+ * @subtree_control is to be applied to @cgrp.  The returned mask is always
+ * a superset of @subtree_control and follows the usual hierarchy rules.
  */
-static void cgroup_refresh_child_subsys_mask(struct cgroup *cgrp)
+static unsigned int cgroup_calc_child_subsys_mask(struct cgroup *cgrp,
+						  unsigned int subtree_control)
 {
 	struct cgroup *parent = cgroup_parent(cgrp);
-	unsigned int cur_ss_mask = cgrp->subtree_control;
+	unsigned int cur_ss_mask = subtree_control;
 	struct cgroup_subsys *ss;
 	int ssid;
 
 	lockdep_assert_held(&cgroup_mutex);
 
-	if (!cgroup_on_dfl(cgrp)) {
-		cgrp->child_subsys_mask = cur_ss_mask;
-		return;
-	}
+	if (!cgroup_on_dfl(cgrp))
+		return cur_ss_mask;
 
 	while (true) {
 		unsigned int new_ss_mask = cur_ss_mask;
@@ -1104,7 +1103,20 @@ static void cgroup_refresh_child_subsys_mask(struct cgroup *cgrp)
 		cur_ss_mask = new_ss_mask;
 	}
 
-	cgrp->child_subsys_mask = cur_ss_mask;
+	return cur_ss_mask;
+}
+
+/**
+ * cgroup_refresh_child_subsys_mask - update child_subsys_mask
+ * @cgrp: the target cgroup
+ *
+ * Update @cgrp->child_subsys_mask according to the current
+ * @cgrp->subtree_control using cgroup_calc_child_subsys_mask().
+ */
+static void cgroup_refresh_child_subsys_mask(struct cgroup *cgrp)
+{
+	cgrp->child_subsys_mask =
+		cgroup_calc_child_subsys_mask(cgrp, cgrp->subtree_control);
 }
 
 /**
@@ -2774,7 +2786,7 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 					    loff_t off)
 {
 	unsigned int enable = 0, disable = 0;
-	unsigned int css_enable, css_disable, old_ctrl, new_ctrl;
+	unsigned int css_enable, css_disable, old_sc, new_sc, old_ss, new_ss;
 	struct cgroup *cgrp, *child;
 	struct cgroup_subsys *ss;
 	char *tok;
@@ -2826,36 +2838,6 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 				ret = -ENOENT;
 				goto out_unlock;
 			}
-
-			/*
-			 * @ss is already enabled through dependency and
-			 * we'll just make it visible.  Skip draining.
-			 */
-			if (cgrp->child_subsys_mask & (1 << ssid))
-				continue;
-
-			/*
-			 * Because css offlining is asynchronous, userland
-			 * might try to re-enable the same controller while
-			 * the previous instance is still around.  In such
-			 * cases, wait till it's gone using offline_waitq.
-			 */
-			cgroup_for_each_live_child(child, cgrp) {
-				DEFINE_WAIT(wait);
-
-				if (!cgroup_css(child, ss))
-					continue;
-
-				cgroup_get(child);
-				prepare_to_wait(&child->offline_waitq, &wait,
-						TASK_UNINTERRUPTIBLE);
-				cgroup_kn_unlock(of->kn);
-				schedule();
-				finish_wait(&child->offline_waitq, &wait);
-				cgroup_put(child);
-
-				return restart_syscall();
-			}
 		} else if (disable & (1 << ssid)) {
 			if (!(cgrp->subtree_control & (1 << ssid))) {
 				disable &= ~(1 << ssid);
@@ -2891,17 +2873,46 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
 	 * subsystems than specified may need to be enabled or disabled
 	 * depending on subsystem dependencies.
 	 */
-	cgrp->subtree_control |= enable;
-	cgrp->subtree_control &= ~disable;
+	old_sc = cgrp->subtree_control;
+	old_ss = cgrp->child_subsys_mask;
+	new_sc = (old_sc | enable) & ~disable;
+	new_ss = cgroup_calc_child_subsys_mask(cgrp, new_sc);
 
-	old_ctrl = cgrp->child_subsys_mask;
-	cgroup_refresh_child_subsys_mask(cgrp);
-	new_ctrl = cgrp->child_subsys_mask;
-
-	css_enable = ~old_ctrl & new_ctrl;
-	css_disable = old_ctrl & ~new_ctrl;
+	css_enable = ~old_ss & new_ss;
+	css_disable = old_ss & ~new_ss;
 	enable |= css_enable;
 	disable |= css_disable;
+
+	/*
+	 * Because css offlining is asynchronous, userland might try to
+	 * re-enable the same controller while the previous instance is
+	 * still around.  In such cases, wait till it's gone using
+	 * offline_waitq.
+	 */
+	for_each_subsys(ss, ssid) {
+		if (!(css_enable & (1 << ssid)))
+			continue;
+
+		cgroup_for_each_live_child(child, cgrp) {
+			DEFINE_WAIT(wait);
+
+			if (!cgroup_css(child, ss))
+				continue;
+
+			cgroup_get(child);
+			prepare_to_wait(&child->offline_waitq, &wait,
+					TASK_UNINTERRUPTIBLE);
+			cgroup_kn_unlock(of->kn);
+			schedule();
+			finish_wait(&child->offline_waitq, &wait);
+			cgroup_put(child);
+
+			return restart_syscall();
+		}
+	}
+
+	cgrp->subtree_control = new_sc;
+	cgrp->child_subsys_mask = new_ss;
 
 	/*
 	 * Create new csses or make the existing ones visible.  A css is
@@ -2983,9 +2994,8 @@ out_unlock:
 	return ret ?: nbytes;
 
 err_undo_css:
-	cgrp->subtree_control &= ~enable;
-	cgrp->subtree_control |= disable;
-	cgroup_refresh_child_subsys_mask(cgrp);
+	cgrp->subtree_control = old_sc;
+	cgrp->child_subsys_mask = old_ss;
 
 	for_each_subsys(ss, ssid) {
 		if (!(enable & (1 << ssid)))
@@ -4521,6 +4531,8 @@ static void css_release_work_fn(struct work_struct *work)
 	if (ss) {
 		/* css release path */
 		cgroup_idr_remove(&ss->css_idr, css->id);
+		if (ss->css_released)
+			ss->css_released(css);
 	} else {
 		/* cgroup release path */
 		cgroup_idr_remove(&cgrp->root->cgroup_idr, cgrp->id);

@@ -393,8 +393,8 @@ struct css_set {
  * struct cftype: handler definitions for cgroup control files
  *
  * When reading/writing to a file:
- *	- the cgroup to use is file->f_dentry->d_parent->d_fsdata
- *	- the 'cftype' of the file is file->f_dentry->d_fsdata
+ *	- the cgroup to use is file->f_path.dentry->d_parent->d_fsdata
+ *	- the 'cftype' of the file is file->f_path.dentry->d_fsdata
  */
 
 /* cftype->flags */
@@ -638,6 +638,7 @@ struct cgroup_subsys {
 	struct cgroup_subsys_state *(*css_alloc)(struct cgroup_subsys_state *parent_css);
 	int (*css_online)(struct cgroup_subsys_state *css);
 	void (*css_offline)(struct cgroup_subsys_state *css);
+	void (*css_released)(struct cgroup_subsys_state *css);
 	void (*css_free)(struct cgroup_subsys_state *css);
 	void (*css_reset)(struct cgroup_subsys_state *css);
 	void (*css_e_css_changed)(struct cgroup_subsys_state *css);

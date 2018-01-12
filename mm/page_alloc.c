@@ -473,17 +473,15 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
 		return 0;
 
 	if (page_is_guard(buddy) && page_order(buddy) == order) {
-		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
-
 		if (page_zone_id(page) != page_zone_id(buddy))
 			return 0;
+
+		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
 
 		return 1;
 	}
 
 	if (PageBuddy(buddy) && page_order(buddy) == order) {
-		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
-
 		/*
 		 * zone check is done late to avoid uselessly
 		 * calculating zone/node ids for pages that could
@@ -491,6 +489,8 @@ static inline int page_is_buddy(struct page *page, struct page *buddy,
 		 */
 		if (page_zone_id(page) != page_zone_id(buddy))
 			return 0;
+
+		VM_BUG_ON_PAGE(page_count(buddy) != 0, buddy);
 
 		return 1;
 	}
@@ -2139,7 +2139,7 @@ zonelist_scan:
 
 	/*
 	 * Scan zonelist, looking for a zone with enough free.
-	 * See also __cpuset_node_allowed_softwall() comment in kernel/cpuset.c.
+	 * See also __cpuset_node_allowed() comment in kernel/cpuset.c.
 	 */
 	for_each_zone_zonelist_nodemask(zone, z, zonelist, ac->high_zoneidx,
 								ac->nodemask) {
@@ -2640,7 +2640,7 @@ gfp_to_alloc_flags(gfp_t gfp_mask)
 			alloc_flags |= ALLOC_HARDER;
 		/*
 		 * Ignore cpuset mems for GFP_ATOMIC rather than fail, see the
-		 * comment for __cpuset_node_allowed_softwall().
+		 * comment for __cpuset_node_allowed().
 		 */
 		alloc_flags &= ~ALLOC_CPUSET;
 	} else if (unlikely(rt_task(current)) && !in_interrupt())
