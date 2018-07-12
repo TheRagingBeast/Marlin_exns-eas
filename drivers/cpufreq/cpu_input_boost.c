@@ -294,7 +294,7 @@ static void fb_unboost_worker(struct work_struct *work)
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
 	/* Reset dynamic stune boost value to the default value */
 	reset_stune_boost("top-app");
-	set_stune_boost("rt", dsb_rt_reset);
+	do_stune_boost("rt", dsb_rt_reset);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	clear_boost_bit(b, FB_BOOST);
