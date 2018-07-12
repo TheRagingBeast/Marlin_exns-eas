@@ -125,13 +125,15 @@ static void update_online_cpu_policy(void)
 
 static void unboost_all_cpus(struct boost_drv *b)
 {
-	if (!cancel_delayed_work_sync(&b->input_unboost) &&
+	if (!cancel_delayed_work_sync(&b->fb_unboost) &&
 		!cancel_delayed_work_sync(&b->max_unboost))
 		return;
  
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
 	/* Reset dynamic stune boost value to the default value */
 	reset_stune_boost("top-app");
+	set_stune_boost("rt", dsb_rt_reset);
+	set_stune_boost("foreground", dsb_fg_reset);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	clear_boost_bit(b, INPUT_BOOST | WAKE_BOOST | MAX_BOOST | FB_BOOST);
@@ -282,7 +284,7 @@ static void fb_unboost_worker(struct work_struct *work)
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
 	/* Reset dynamic stune boost value to the default value */
 	reset_stune_boost("top-app");
-	do_stune_boost("rt", dsb_rt_reset);
+	set_stune_boost("rt", dsb_rt_reset);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	clear_boost_bit(b, FB_BOOST);
