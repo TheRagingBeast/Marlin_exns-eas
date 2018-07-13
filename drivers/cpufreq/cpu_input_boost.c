@@ -29,6 +29,8 @@
 #define FB_BOOST		(1U << 4)
 
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
+static int dsb_global_perf_bias = 0;
+module_param(dsb_global_perf_bias, uint, 0644);
 // Schedtune boost groups
 static int dsb_rt_boost = 40;
 module_param(dsb_rt_boost, uint, 0644);
@@ -180,9 +182,9 @@ static void __cpu_input_boost_kick_max(struct boost_drv *b,
 
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
 	/* Set dynamic stune boost values */
-	do_stune_boost("top-app", dsb_kick_max_boost);
-	set_stune_boost("rt", dsb_rt_boost);
-	set_stune_boost("foreground", dsb_fg_boost);
+	do_stune_boost("top-app", dsb_kick_max_boost + dsb_global_perf_bias);
+	set_stune_boost("rt", dsb_rt_boost + dsb_global_perf_bias);
+	set_stune_boost("foreground", dsb_fg_boost + dsb_global_perf_bias);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	atomic_set(&b->max_boost_dur, duration_ms);
@@ -210,7 +212,7 @@ static void input_boost_worker(struct work_struct *work)
 
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
 	/* Set dynamic stune boost value */
-	do_stune_boost("top-app", dsb_kick_boost);
+	do_stune_boost("top-app", dsb_kick_boost + dsb_global_perf_bias);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	queue_delayed_work(b->wq, &b->input_unboost,
@@ -242,9 +244,9 @@ static void max_boost_worker(struct work_struct *work)
 
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
 	/* Set dynamic stune boost value */
-	do_stune_boost("top-app", dsb_kick_max_boost);
+	do_stune_boost("top-app", dsb_kick_max_boost + dsb_global_perf_bias);
 	set_stune_boost("rt", dsb_rt_boost);
-	set_stune_boost("foreground", dsb_fg_boost);
+	set_stune_boost("foreground", dsb_fg_boost + dsb_global_perf_bias);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	queue_delayed_work(b->wq, &b->max_unboost,
@@ -278,8 +280,8 @@ static void fb_boost_worker(struct work_struct *work)
 
 #ifdef CONFIG_DYNAMIC_STUNE_BOOST
 	/* Set dynamic stune boost value */
-	do_stune_boost("top-app", dsb_fb_kick_boost);
-	do_stune_boost("rt", dsb_rt_boost);
+	do_stune_boost("top-app", dsb_fb_kick_boost + dsb_global_perf_bias);
+	do_stune_boost("rt", dsb_rt_boost + dsb_global_perf_bias);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 	queue_delayed_work(b->wq, &b->fb_unboost,
