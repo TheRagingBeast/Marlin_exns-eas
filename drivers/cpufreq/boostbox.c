@@ -45,26 +45,27 @@ static int dsb_reset_zero = 0;
  * Schedtune boost groups
 */
 
-// top-app boost
+// dsb_kick_max_boost ~ app launches & wake boost
+static int dsb_kick_max_boost = 30;
+module_param(dsb_kick_max_boost, uint, 0644);
+// top-app schedtune boostgroup
 static int dsb_top_app_boost = 20;
 module_param(dsb_top_app_boost, uint, 0644);
-// audio boost 
-static int dsb_audio_boost = 5;
+// gfx schedtune boostgroup ~ used by mdss/fbdev
+static int dsb_gfx_kick_boost = 20;
+module_param(dsb_gfx_kick_boost, uint, 0644);
+// realtime schedtune boostgroup
+static int dsb_rt_boost = 18;
+module_param(dsb_rt_boost, uint, 0644);
+// forgeground schedtune boostgroup
+static int dsb_fg_boost = 6;
+module_param(dsb_fg_boost, uint, 0644);
+// audio schedtune boostgroup (unused for now)
+static int dsb_audio_boost = 6;
 module_param(dsb_audio_boost, uint, 0644);
 // audio boost duration (unused for now)
 static int audio_boost_ms = 64;
 module_param(audio_boost_ms, uint, 0644);
-// gfx kick boost ~ used by mdss/fbdev
-static int dsb_gfx_kick_boost = 22;
-module_param(dsb_gfx_kick_boost, uint, 0644);
-// rt boost
-static int dsb_rt_boost = 18;
-module_param(dsb_rt_boost, uint, 0644);
-static int dsb_fg_boost = 6;
-module_param(dsb_fg_boost, uint, 0644);
-// dsb_kick_max_boost ~ app launches & wake boost
-static int dsb_kick_max_boost = 35;
-module_param(dsb_kick_max_boost, uint, 0644);
 #endif /* CONFIG_DYNAMIC_STUNE_BOOST */
 
 // cpu boost frequencies
